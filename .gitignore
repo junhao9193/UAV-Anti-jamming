@@ -1,0 +1,9 @@
+/.claude
+/.vscode
+/codex-claude.txt
+/MA-CJD-MARL/
+/MetaRL-for-UAV-Anti-jamming/
+
+# Python bytecode
+__pycache__/
+*.pyc
