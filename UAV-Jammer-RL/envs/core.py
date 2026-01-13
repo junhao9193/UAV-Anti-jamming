@@ -20,46 +20,58 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from .channels import UAVchannels, Jammerchannels
+from .config import load_env_config
 from .entities import UAV, Jammer, RP
+from .jammer_policy import (
+    generate_p_trans as generate_jammer_p_trans,
+    init_jammer_state,
+    renew_jammer_channels_after_Rx as jammer_channels_after_Rx,
+    renew_jammer_channels_after_learn as jammer_channels_after_learn,
+)
 
 class Environ(gym.Env):
-    def __init__(self):
-        self.length = 500  # 1000
-        self.width = 250  # 500
-        self.low_height = 60
-        self.high_height = 120
-        self.BS_position = [self.length / 2, self.width / 2, (self.low_height + self.high_height) / 2]  # Suppose the BS is in the center
-        self.k = 0.8
-        self.sigma = 0.2
+    def __init__(self, config=None, config_path=None):
+        cfg = load_env_config(config=config, config_path=config_path)
+
+        self.length = cfg["length"]  # 1000
+        self.width = cfg["width"]  # 500
+        self.low_height = cfg["low_height"]
+        self.high_height = cfg["high_height"]
+        self.BS_position = cfg.get(
+            "BS_position",
+            [self.length / 2, self.width / 2, (self.low_height + self.high_height) / 2],  # Suppose the BS is in the center
+        )
+        self.k = cfg["k"]
+        self.sigma = cfg["sigma"]
 
         #无人机、干扰机各种参数
-        self.uav_power_list = [36, 33, 30, 27, 23]  #TODO dBm = 1W-2W
+        self.uav_power_list = cfg["uav_power_list"]  # TODO dBm = 1W-2W
         self.uav_power_min = min(self.uav_power_list)
         self.uav_power_max = max(self.uav_power_list)
-        self.jammer_power = 30  # dBm
-        self.sig2_dB = -114  # dBm       Noise power
+        self.jammer_power = cfg["jammer_power"]  # dBm
+        self.sig2_dB = cfg["sig2_dB"]  # dBm       Noise power
         self.sig2 = 10 ** (self.sig2_dB / 10)
-        self.uavAntGain = 3  # dBi       uav antenna gain
-        self.uavNoiseFigure = 9  # dB    uav receiver noise figure
-        self.jammerAntGain = 3  # dBi       jammer antenna gain
-        self.bandwidth = 1.8 * 1e+6  # 1.5 * 1e+6   # Hz
+        self.uavAntGain = cfg["uavAntGain"]  # dBi       uav antenna gain
+        self.uavNoiseFigure = cfg["uavNoiseFigure"]  # dB    uav receiver noise figure
+        self.jammerAntGain = cfg["jammerAntGain"]  # dBi       jammer antenna gain
+        self.bandwidth = cfg["bandwidth"]  # Hz
 
         #数据传输过程的参数
-        self.data_size = 0.8 * 1024 ** 2
-        self.t_Rx = 0.98  # 传输时间,单位都是s
-        self.t_collect = 0.5  # 收集数据
-        self.timestep = 0.2  # 频谱感知，选动作 + ACK + 学习
+        self.data_size = cfg["data_size"]
+        self.t_Rx = cfg["t_Rx"]  # 传输时间,单位都是s
+        self.t_collect = cfg["t_collect"]  # 收集数据
+        self.timestep = cfg["timestep"]  # 频谱感知，选动作 + ACK + 学习
         self.timeslot = self.t_Rx + self.timestep  # 时隙
         self.t_uav = 0.00
         # self.t_uav = Decimal(self.t_uav).quantize(Decimal("0.00"))
-        self.jammer_start = 0.2  # 干扰机开始干扰时间
-        self.t_dwell = 2.28  # 干扰机扫频停留时间
+        self.jammer_start = cfg["jammer_start"]  # 干扰机开始干扰时间
+        self.t_dwell = cfg["t_dwell"]  # 干扰机扫频停留时间
         self.t_jammer = 0.00
         # self.t_jammer = Decimal(self.t_jammer).quantize(Decimal("0.00"))
 
         #参考点群移动模型
-        self.n_ch = 4  #TODO UAV簇头个数
-        self.n_cm_for_a_ch = 2  # 每个ch的簇成员个数
+        self.n_ch = cfg["n_ch"]  # TODO UAV簇头个数
+        self.n_cm_for_a_ch = cfg["n_cm_for_a_ch"]  # 每个ch的簇成员个数
         self.n_cm = self.n_ch * self.n_cm_for_a_ch  # UAV簇成员个数
         self.n_uav = self.n_ch + self.n_cm  # number of UAVs
         self.n_rp_ch = self.n_ch
@@ -67,21 +79,25 @@ class Environ(gym.Env):
         self.n_rp = self.n_uav  # 簇成员的参考节点个数
         self.n_des = self.n_cm_for_a_ch  # 每个ch的通信目标数
         self.n_uav_pair = self.n_ch * self.n_des  # 一共6个通信对
-        self.n_jammer = 3  # number of jammers
-        self.n_channel = 8  # int(self.n_ch+self.n_jammer-1)  # number of channels
+        self.n_jammer = cfg["n_jammer"]  # number of jammers
+        self.n_channel = cfg["n_channel"]  # int(self.n_ch+self.n_jammer-1)  # number of channels
         self.channel_indexes = np.arange(self.n_channel)
         self.channels = np.zeros([self.n_channel], dtype=np.int32)
-        self.states_observed = 2  # 信道被干扰或未被干扰
+        self.states_observed = cfg["states_observed"]  # 信道被干扰或未被干扰
 
-        self.p_md = 0  # 漏警概率
-        self.p_fa = 0  # 虚警概率
-        self.pn0 = 20  # 数据包长度
+        self.p_md = cfg["p_md"]  # 漏警概率
+        self.p_fa = cfg["p_fa"]  # 虚警概率
+        self.pn0 = cfg["pn0"]  # 数据包长度
 
-        self.max_distance1 = 99
-        self.max_distance2 = 1
+        self.max_distance1 = cfg["max_distance1"]
+        self.max_distance2 = cfg["max_distance2"]
 
-        self.is_jammer_moving = True
-        self.type_of_interference = "markov"
+        self.is_jammer_moving = cfg["is_jammer_moving"]
+        self.type_of_interference = cfg["type_of_interference"]
+        self.step_forward = cfg["step_forward"]
+        self.p_trans_mode = cfg["p_trans_mode"]
+        self.reward_energy_weight = cfg["reward_energy_weight"]
+        self.reward_jump_weight = cfg["reward_jump_weight"]
         # "markov"首先干扰机通过检测智能体的主要变化,
         # 识别agent的工作模式并且建立工作模式状态转移的马尔可夫链,
         # 然后利用合适的算法对建立的agent工作模式转移马尔可夫链计算转移概率,
@@ -115,7 +131,7 @@ class Environ(gym.Env):
 
         # 初始化观察状态和环境
         self.all_observed_states()
-        self.reset(self.generate_p_trans())
+        self.reset(self.generate_p_trans(mode=self.p_trans_mode))
         self.state_dim = len(self.get_state()[0])
         self.observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(self.state_dim,)) for _ in range(self.n_ch)]
 
@@ -261,15 +277,7 @@ class Environ(gym.Env):
             for j in range(self.n_des):
                 self.uav_channels[i][j] = random.randint(0, self.n_channel - 1)  #包括上下限
                 self.uav_powers[i][j] = self.uav_power_list[random.randint(0, len(self.uav_power_list) - 1)]  # 包括上下限
-        if self.type_of_interference == "saopin":
-            # self.jammer_channels = random.sample(range(0, self.n_channel), k=self.n_jammer)  #不包括 stop
-            self.jammer_channels = random.choices(range(self.n_channel), k=self.n_jammer)
-        elif self.type_of_interference == "markov":
-            self.jammer_channels = random.choices(self.all_jammer_states_list, k=1)[0]
-        self.jammer_channels_list = []
-        self.jammer_index_list = []
-        #如果传输阶段先后干扰两个信道,0是后半段 改变后的信道，1是前半段 改变前的信道
-        self. jammer_time = np.zeros([2])  # 每个干扰机在传输阶段最多先后干扰两个信道，目前假设各个干扰机时间线相同
+        init_jammer_state(self)
 
         # print("jammer_channels", self.jammer_channels)
 
@@ -434,7 +442,7 @@ class Environ(gym.Env):
             jump = self.uav_jump_count[tra] # 跳频开销
             self.rew_jump += jump
             # uav_rewards[tra] += (0.5 * energy - 0.5 * jump)
-            uav_rewards[tra] += suc - (2 * energy + 0.1 * jump)
+            uav_rewards[tra] += suc - (self.reward_energy_weight * energy + self.reward_jump_weight * jump)
             # print(energy, jump, suc)
             # 保留两位小数
             rec += 1
@@ -457,88 +465,10 @@ class Environ(gym.Env):
         self.rew_suc = 0
 
     def renew_jammer_channels_after_Rx(self):
-        self.t_uav += self.t_Rx
-        self.t_jammer += self.t_Rx
-        # self.jammer_channels_list = []
-        if np.floor_divide((self.t_jammer - self.t_Rx), self.t_dwell) == np.floor_divide(self.t_jammer, self.t_dwell) - 1: 
-            # （干扰机时间-传输时间0.98）/干扰机扫频停留时间2.28 == 干扰机时间/干扰机扫频停留时间 - 1
-            if self.type_of_interference == "saopin":
-                for i in range(self.n_jammer):
-                    self.jammer_channels[i] += self.step_forward
-                    self.jammer_channels[i] = int(self.jammer_channels[i] % self.n_channel)
-
-                if self.t_jammer % self.t_dwell == 0:
-                    for i in range(self.n_jammer):
-                        self.jammer_channels_list.append(
-                            (self.jammer_channels[i] + self.n_channel - 1) % self.n_channel)
-                        self.jammer_index_list.append(i)
-                    self.jammer_time[0] = self.t_Rx
-
-                else:  # 正好在Rx中间切换干扰信道
-                    for i in range(self.n_jammer):
-                        self.jammer_channels_list.append(self.jammer_channels[i])  # 后半段
-                        self.jammer_index_list.append(i)
-                        self.jammer_channels_list.append(
-                            (self.jammer_channels[i] + self.n_channel - 1) % self.n_channel)  # jammer_channels[i]-1
-                        self.jammer_index_list.append(i)
-                    change_times = np.floor_divide(self.t_jammer, self.t_dwell)
-                    change_point = change_times * self.t_dwell
-
-                    self.jammer_time[0] = self.t_jammer - change_point  # 0对应传输后半段的干扰时间
-                    self.jammer_time[1] = self.t_Rx - self.jammer_time[0]
-
-            elif self.type_of_interference == "markov":
-                old_jammer_channels = self.jammer_channels
-                self.jammer_channels = tuple(self.jammer_channels)
-                idx = self.all_jammer_states_list.index(self.jammer_channels)
-                p = self.p_trans[idx]
-                self.jammer_channels = random.choices(self.all_jammer_states_list, weights=p, k=1)[0]
-
-                if self.t_jammer % self.t_dwell == 0:  # 传输完成后切换干扰信道
-                    for i in range(self.n_jammer):
-                        self.jammer_channels_list.append(old_jammer_channels[i])
-                        self.jammer_index_list.append(i)
-                    self.jammer_time[0] = self.t_Rx
-
-                else:  # 传输中切换干扰信道
-                    for i in range(self.n_jammer):
-                        self.jammer_channels_list.append(self.jammer_channels[i])  # 后半段
-                        self.jammer_index_list.append(i)
-                        self.jammer_channels_list.append(old_jammer_channels[i])  # jammer_channels[i]-1
-                        self.jammer_index_list.append(i)
-                    change_times = np.floor_divide(self.t_jammer, self.t_dwell)
-                    change_point = change_times * self.t_dwell
-
-                    self.jammer_time[0] = self.t_jammer - change_point  # 0对应传输后半段的干扰时间
-                    self.jammer_time[1] = self.t_Rx - self.jammer_time[0]
-
-            # print("jammer_channels", self.jammer_channels_list)
+        jammer_channels_after_Rx(self)
 
     def renew_jammer_channels_after_learn(self):
-        self.t_uav += self.timestep
-        self.t_jammer += self.timestep
-        if np.floor_divide((self.t_jammer - self.timestep), self.t_dwell) == np.floor_divide(self.t_jammer, self.t_dwell) - 1:  # 这里是什么意思
-            if self.type_of_interference == "saopin":
-                for i in range(self.n_jammer):
-                    self.jammer_channels[i] += self.step_forward
-                    self.jammer_channels[i] = int(self.jammer_channels[i] % self.n_channel)
-
-                    self.jammer_channels_list.append(self.jammer_channels[i])
-                    self.jammer_index_list.append(i)
-                self.jammer_time[0] = self.t_Rx
-
-            elif self.type_of_interference == "markov":
-                idx = self.all_jammer_states_list.index(self.jammer_channels)
-                p = self.p_trans[idx]
-                self.jammer_channels = random.choices(self.all_jammer_states_list, weights=p, k=1)[0]
-
-                # if self.t_jammer % self.t_dwell == 0:  传输开始前切换干扰信道
-                for i in range(self.n_jammer):
-                    self.jammer_channels_list.append(self.jammer_channels[i])
-                    self.jammer_index_list.append(i)
-                self.jammer_time[0] = self.t_Rx
-
-            # print("change_channels", self.jammer_channels)
+        jammer_channels_after_learn(self)
 
     # 更新簇头的位置，在无人机获知网络状态信息阶段，簇头无人机根据方向，delta距离来更新其位置
     def renew_positions_of_chs(self):
@@ -803,33 +733,7 @@ class Environ(gym.Env):
                 action[i] = int(action[i] / self.action_range)
 
     def generate_p_trans(self, mode = 1):
-        # 不使用uniform, 因为从统计上感觉很好学, 差异性不大
-        p_trans = np.random.uniform(0, 1, [self.jammer_state_dim, self.jammer_state_dim])#从[0,1)的均匀分布里随机取self.jammer_state_dim*self.jammer_state_dim个数
-        p_trans_sum = np.sum(p_trans, axis=1)#将矩阵p_trans每一行的数相加得到列向量
-        if mode == 1:
-            for i in range(self.jammer_state_dim):
-                temp = np.random.randint(low=0, high=self.jammer_state_dim)
-                p_trans[i][temp] += p_trans_sum[i] / 2
-                while np.random.random() > 0.5:
-                    temp = np.random.randint(low=0, high=self.jammer_state_dim)
-                    p_trans[i][temp] += p_trans_sum[i] / 3
-        elif mode == 2:
-            for i in range(self.jammer_state_dim):
-                while np.random.random() > 0.7:
-                    temp = np.random.randint(low=0, high=self.jammer_state_dim)
-                    p_trans[i][temp] += p_trans_sum[i] / 2
-        elif mode == 3:
-            pass
-        elif mode == 4:
-            for i in range(self.jammer_state_dim):
-                temp = np.random.randint(low=0, high=self.jammer_state_dim)
-                p_trans[i][temp] += p_trans_sum[i]
-
-        p_trans_sum = np.sum(p_trans, axis=1)
-        for i in range(self.jammer_state_dim):
-            for j in range(self.jammer_state_dim):
-                p_trans[i][j] = p_trans[i][j]/p_trans_sum[i]#将矩阵p_trans的每个元素用每一行元素之和进行归一化
-        return p_trans
+        return generate_jammer_p_trans(self.jammer_state_dim, mode=mode)
 
     def set_p(self, p_trans):
         self.p_trans = p_trans
