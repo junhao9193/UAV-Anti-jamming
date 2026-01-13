@@ -39,8 +39,11 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "type_of_interference": "markov",
     "step_forward": 1,
     "p_trans_mode": 1,
-    "reward_energy_weight": 2.0,
+    "reward_energy_weight": 1.0,
     "reward_jump_weight": 0.1,
+    "csi_pathloss_offset": 80.0,
+    "csi_pathloss_scale": 60.0,
+    "csi_clip": True,
 }
 
 

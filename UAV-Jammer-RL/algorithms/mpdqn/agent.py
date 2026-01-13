@@ -99,7 +99,7 @@ class MPDQNAgent:
         batch = self.buffer.sample(self.batch_size)
 
         state = torch.from_numpy(batch["state"]).to(self.device)
-        action_discrete = torch.from_numpy(batch["action_discrete"]).to(self.device).view(-1, 1)
+        action_discrete = torch.from_numpy(batch["action_discrete"]).long().to(self.device).view(-1, 1)
         action_params = torch.from_numpy(batch["action_params"]).to(self.device).view(-1, self.n_actions, self.param_dim)
         reward = torch.from_numpy(batch["reward"]).to(self.device).view(-1, 1)
         next_state = torch.from_numpy(batch["next_state"]).to(self.device)
@@ -125,13 +125,13 @@ class MPDQNAgent:
         loss_q.backward()
         self.q_opt.step()
 
-        # --- Actor update (maximize max_a Q(s, a, mu(s)_a)) ---
+        # --- Actor update ---
         for p in self.q_net.parameters():
             p.requires_grad = False
 
         params_pred = self.actor(state)
         q_pred = self.q_net(state, params_pred)
-        loss_actor = -q_pred.max(dim=1)[0].mean()
+        loss_actor = -q_pred.mean()
 
         self.actor_opt.zero_grad()
         loss_actor.backward()

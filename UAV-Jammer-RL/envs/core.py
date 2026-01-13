@@ -102,6 +102,9 @@ class Environ(gym.Env):
         self.p_trans_mode = cfg["p_trans_mode"]
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
+        self.csi_pathloss_offset = float(cfg.get("csi_pathloss_offset", 80.0))
+        self.csi_pathloss_scale = float(cfg.get("csi_pathloss_scale", 60.0))
+        self.csi_clip = bool(cfg.get("csi_clip", True))
         # "markov"首先干扰机通过检测智能体的主要变化,
         # 识别agent的工作模式并且建立工作模式状态转移的马尔可夫链,
         # 然后利用合适的算法对建立的agent工作模式转移马尔可夫链计算转移概率,
@@ -342,7 +345,10 @@ class Environ(gym.Env):
                 for j in range(self.n_des):
                     tra_id = self.uav_pairs[i][j][0]        # 接收机和发射机
                     rec_id = self.uav_pairs[i][j][1]
-                    csi[i][j] = (self.UAVchannels_with_fastfading[tra_id][rec_id] - 80) / 60
+                    csi_ij = (self.UAVchannels_loss_db[tra_id][rec_id] - self.csi_pathloss_offset) / self.csi_pathloss_scale
+                    if self.csi_clip:
+                        csi_ij = np.clip(csi_ij, -1.0, 1.0)
+                    csi[i][j] = csi_ij
             uav_channels = self.uav_channels / self.n_channel
             uav_powers = self.uav_powers / self.uav_power_max
             jammer_channels = np.asarray([x / self.n_channel for x in self.jammer_channels])      #for item in list,获取列表中的每一项
@@ -357,13 +363,13 @@ class Environ(gym.Env):
 
         transmitter_idx = self.uav_pairs[i][j][0]
         receiver_idx = self.uav_pairs[i][j][1]
-        uav_signal = 10 ** ((self.uav_powers[i][j] - self.UAVchannels_with_fastfading[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
+        uav_signal = 10 ** ((self.uav_powers[i][j] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
                              2 * self.uavAntGain - self.uavNoiseFigure) / 10)
         if self.uav_channels[i][j] in other_channel_list:
             index = np.where(other_channel_list == self.uav_channels[i][j])
             for k in range(len(index[0])):
                 ii, jj = pairs[index[0][k]]
-                uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_with_fastfading[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
+                uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
                                             2 * self.uavAntGain - self.uavNoiseFigure) / 10)     #无人机内部干扰
 
         if self.uav_channels[i][j] in self.jammer_channels_list:
@@ -371,7 +377,7 @@ class Environ(gym.Env):
             if self.jammer_time[0] == self.t_Rx or self.jammer_time[0] == self.t_Rx-self.jammer_start:     # 传输时间干扰机没换信道
                 for m in range(len(idx)):
                     jammer_idx = self.jammer_index_list[idx[m][0]]
-                    uav_interference += 10 ** ((self.jammer_power - self.Jammerchannels_with_fastfading[jammer_idx, receiver_idx, self.uav_channels[i][j]] + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
+                    uav_interference += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
                 uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + self.sig2)))
                 uav_rate *= self.bandwidth
                 transmit_time = self.data_size / uav_rate
@@ -381,7 +387,7 @@ class Environ(gym.Env):
                 for m in range(len(idx)):
                     jammer_idx = self.jammer_index_list[idx[m][0]]
                     if idx[m][0] % 2 == 0:   # 后半段(self.jammer_channels_list先存入的后半段干扰信道序号）
-                        uav_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_with_fastfading[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
+                        uav_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
 
                 uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + uav_interference_from_jammer0 + self.sig2)))
@@ -391,7 +397,7 @@ class Environ(gym.Env):
                 for l in range(len(idx)):
                     jammer_idx = self.jammer_index_list[idx[l][0]]
                     if idx[l][0] % 2 == 1:   # 前半段
-                        uav_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_with_fastfading[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
+                        uav_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
                 uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + uav_interference_from_jammer1 + self.sig2)))
                 uav_rate *= self.bandwidth
@@ -450,7 +456,9 @@ class Environ(gym.Env):
             jump = self.uav_jump_count[tra] # 跳频开销
             self.rew_jump += jump
             # uav_rewards[tra] += (0.5 * energy - 0.5 * jump)
-            uav_rewards[tra] += suc - (self.reward_energy_weight * energy + self.reward_jump_weight * jump)
+            max_energy = 10 ** (self.uav_power_max / 10 - 3) * self.t_Rx + 1e-12
+            norm_energy = float(energy / max_energy)
+            uav_rewards[tra] += suc - (self.reward_energy_weight * norm_energy + self.reward_jump_weight * jump)
             # print(energy, jump, suc)
             # 保留两位小数
             rec += 1
@@ -710,10 +718,10 @@ class Environ(gym.Env):
         self.UAVchannels.update_positions(uav_positions)
         self.Jammerchannels.update_pathloss()
         self.UAVchannels.update_pathloss()
-        UAVchannels_with_fastfading = np.repeat(self.UAVchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
-        self.UAVchannels_with_fastfading = UAVchannels_with_fastfading
-        Jammerchannels_with_fastfading = np.repeat(self.Jammerchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
-        self.Jammerchannels_with_fastfading = Jammerchannels_with_fastfading
+        uav_channels_loss_db = np.repeat(self.UAVchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
+        self.UAVchannels_loss_db = uav_channels_loss_db
+        jammer_channels_loss_db = np.repeat(self.Jammerchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
+        self.Jammerchannels_loss_db = jammer_channels_loss_db
 
     def act(self):
         self.renew_jammer_channels_after_Rx()
