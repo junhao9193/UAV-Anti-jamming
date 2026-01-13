@@ -3,6 +3,7 @@ from __future__ import division
 import numpy as np
 
 from envs import Environ
+from tqdm.auto import trange
 
 
 def train_mpdqn(n_episode=1500, n_steps=1000):
@@ -26,9 +27,13 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
 
     reward_history = []
 
-    for episode in range(n_episode):
+    pbar = trange(n_episode, desc="Training", unit="ep")
+    for episode in pbar:
         state = env.reset(env.generate_p_trans())
-        episode_reward = 0
+        episode_reward = 0.0
+        loss_q_sum = 0.0
+        loss_actor_sum = 0.0
+        loss_count = 0
 
         for step in range(n_steps):
             actions = []
@@ -48,7 +53,11 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
                     next_state=next_state[i],
                     done=bool(done),
                 )
-                agents[i].train_step()
+                loss_info = agents[i].train_step()
+                if loss_info is not None:
+                    loss_q_sum += float(loss_info["loss_q"])
+                    loss_actor_sum += float(loss_info["loss_actor"])
+                    loss_count += 1
 
             state = next_state
             episode_reward += np.mean(rewards)
@@ -62,9 +71,16 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
 
         reward_history.append(episode_reward)
 
-        if (episode + 1) % 100 == 0:
-            avg_reward = np.mean(reward_history[-100:])
-            print(f"Episode {episode + 1}/{n_episode}, Avg Reward: {avg_reward:.4f}, Epsilon: {epsilon:.4f}")
+        recent_window = min(100, len(reward_history))
+        avg_reward = float(np.mean(reward_history[-recent_window:]))
+        postfix = {
+            "avg_r": f"{avg_reward:.3f}",
+            "eps": f"{epsilon:.3f}",
+        }
+        if loss_count > 0:
+            postfix["loss_q"] = f"{(loss_q_sum / loss_count):.3f}"
+            postfix["loss_a"] = f"{(loss_actor_sum / loss_count):.3f}"
+        pbar.set_postfix(postfix)
 
     return agents, reward_history
 
