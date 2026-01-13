@@ -365,11 +365,13 @@ class Environ(gym.Env):
         receiver_idx = self.uav_pairs[i][j][1]
         uav_signal = 10 ** ((self.uav_powers[i][j] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
                              2 * self.uavAntGain - self.uavNoiseFigure) / 10)
+        other_channel_arr = np.asarray(other_channel_list, dtype=np.int32)
         if self.uav_channels[i][j] in other_channel_list:
-            index = np.where(other_channel_list == self.uav_channels[i][j])
+            index = np.where(other_channel_arr == self.uav_channels[i][j])
             for k in range(len(index[0])):
                 ii, jj = pairs[index[0][k]]
-                uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
+                interferer_tx_idx = self.uav_pairs[ii][jj][0]
+                uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, self.uav_channels[i][j]] +
                                             2 * self.uavAntGain - self.uavNoiseFigure) / 10)     #无人机内部干扰
 
         if self.uav_channels[i][j] in self.jammer_channels_list:
@@ -462,7 +464,7 @@ class Environ(gym.Env):
             # print(energy, jump, suc)
             # 保留两位小数
             rec += 1
-            if rec == 2:
+            if rec == self.n_des:
                 tra += 1
                 rec = 0
 
