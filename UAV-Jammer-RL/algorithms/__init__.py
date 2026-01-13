@@ -1,9 +1,9 @@
-from .agent import Agent
-from .ddrqn_model import DDRQN
-from .replay_memory import ReplayMemory
+from algorithms.ddrqn import Agent, DDRQN, ReplayMemory
+from algorithms.mpdqn import MPDQNAgent
 
 __all__ = [
     "Agent",
     "DDRQN",
+    "MPDQNAgent",
     "ReplayMemory",
 ]

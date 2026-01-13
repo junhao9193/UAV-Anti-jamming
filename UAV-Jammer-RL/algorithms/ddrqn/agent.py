@@ -5,8 +5,8 @@ import random
 import numpy as np
 import torch
 
-from .ddrqn_model import DDRQN
-from .replay_memory import ReplayMemory
+from algorithms.ddrqn.model import DDRQN
+from algorithms.ddrqn.replay_memory import ReplayMemory
 
 class Agent:
     def __init__(self, i, state_dim, action_dim, max_epi_num=50, max_epi_len=300):

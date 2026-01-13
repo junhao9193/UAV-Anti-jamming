@@ -19,10 +19,10 @@ from itertools import combinations, permutations
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .channels import UAVchannels, Jammerchannels
-from .config import load_env_config
-from .entities import UAV, Jammer, RP
-from .jammer_policy import (
+from envs.channels import UAVchannels, Jammerchannels
+from envs.config import load_env_config
+from envs.entities import UAV, Jammer, RP
+from envs.jammer_policy import (
     generate_p_trans as generate_jammer_p_trans,
     init_jammer_state,
     renew_jammer_channels_after_Rx as jammer_channels_after_Rx,
@@ -45,9 +45,13 @@ class Environ(gym.Env):
         self.sigma = cfg["sigma"]
 
         #无人机、干扰机各种参数
-        self.uav_power_list = cfg["uav_power_list"]  # TODO dBm = 1W-2W
-        self.uav_power_min = min(self.uav_power_list)
-        self.uav_power_max = max(self.uav_power_list)
+        uav_power_list = cfg.get("uav_power_list")
+        if uav_power_list is not None:
+            self.uav_power_min = float(min(uav_power_list))
+            self.uav_power_max = float(max(uav_power_list))
+        else:
+            self.uav_power_min = float(cfg["uav_power_min"])
+            self.uav_power_max = float(cfg["uav_power_max"])
         self.jammer_power = cfg["jammer_power"]  # dBm
         self.sig2_dB = cfg["sig2_dB"]  # dBm       Noise power
         self.sig2 = 10 ** (self.sig2_dB / 10)
@@ -115,11 +119,21 @@ class Environ(gym.Env):
         self.uav_pairs = np.zeros([self.n_ch, self.n_des, 2], dtype=np.int32)
         self.uav_clusters = np.zeros([self.n_ch, self.n_cm_for_a_ch, 2], dtype=np.int32)
 
-        self.channel_range = self.n_channel
-        self.power_range = len(self.uav_power_list)
-        self.action_range = self.channel_range * self.power_range
-        self.action_dim = self.action_range ** self.n_des
-        self.action_space = [spaces.Discrete(self.action_dim) for _ in range(self.n_ch)]  # 网络#gym.spaces.Discrete（）功能：创建⼀个离散的n维空间，n为整数
+        # MP-DQN style parameterized action:
+        # - Discrete action selects a channel assignment for all destinations (n_channel ** n_des)
+        # - Continuous parameters provide power for each destination, for each discrete action
+        self.action_dim = int(self.n_channel ** self.n_des)
+        self.param_dim_per_action = int(self.n_des)
+        self.total_param_dim = int(self.action_dim * self.param_dim_per_action)
+        self.action_space = [
+            spaces.Tuple(
+                (
+                    spaces.Discrete(self.action_dim),
+                    spaces.Box(low=0.0, high=1.0, shape=(self.total_param_dim,), dtype=np.float32),
+                )
+            )
+            for _ in range(self.n_ch)
+        ]
 
         #与奖励相关参数
         self.uav_jump_count = np.zeros([self.n_ch], dtype=np.int32)
@@ -271,12 +285,12 @@ class Environ(gym.Env):
         # self.all_observed_states()
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
         self.uav_channels = np.zeros([self.n_ch, self.n_des], dtype=np.int32)   # 每个智能体观察到的全局动作（假设智能体可以观察到其他智能体已经完成的动作）
-        self.uav_powers = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
+        self.uav_powers = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
         self.uav_jump_count = np.zeros([self.n_ch], dtype=np.int32)
         for i in range(self.n_ch):
             for j in range(self.n_des):
                 self.uav_channels[i][j] = random.randint(0, self.n_channel - 1)  #包括上下限
-                self.uav_powers[i][j] = self.uav_power_list[random.randint(0, len(self.uav_power_list) - 1)]  # 包括上下限
+                self.uav_powers[i][j] = random.uniform(self.uav_power_min, self.uav_power_max)  # dBm
         init_jammer_state(self)
 
         # print("jammer_channels", self.jammer_channels)
@@ -295,13 +309,7 @@ class Environ(gym.Env):
 
     def get_state(self):
         if self.policy == "Q_learning":
-            uav_state = 0
-            channels_observed = tuple(sorted(self.jammer_channels))
-            for i in range(self.n_ch):
-                uav_state += self.uav_channels[i] * (self.action_range ** i)
-            observed_state_idx = self.all_observed_states_list.index(channels_observed)
-            joint_state = uav_state * self.observed_state_dim + observed_state_idx
-            return joint_state
+            raise NotImplementedError("Q_learning policy is not supported in continuous-power (MP-DQN) mode.")
 
         elif self.policy == "Sensing_Based_Method":
             if not isinstance(self.jammer_channels, list):
@@ -702,12 +710,10 @@ class Environ(gym.Env):
         self.UAVchannels.update_positions(uav_positions)
         self.Jammerchannels.update_pathloss()
         self.UAVchannels.update_pathloss()
-        self.Jammerchannels.update_fast_fading()
-        self.UAVchannels.update_fast_fading()
         UAVchannels_with_fastfading = np.repeat(self.UAVchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
-        self.UAVchannels_with_fastfading = UAVchannels_with_fastfading - self.UAVchannels.FastFading
+        self.UAVchannels_with_fastfading = UAVchannels_with_fastfading
         Jammerchannels_with_fastfading = np.repeat(self.Jammerchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
-        self.Jammerchannels_with_fastfading = Jammerchannels_with_fastfading - self.Jammerchannels.FastFading
+        self.Jammerchannels_with_fastfading = Jammerchannels_with_fastfading
 
     def act(self):
         self.renew_jammer_channels_after_Rx()
@@ -723,14 +729,30 @@ class Environ(gym.Env):
 
     def decomposition_action(self, action):
         for i in range(self.n_ch):
+            discrete_action, all_action_params = action[i]
+            discrete_action = int(discrete_action)
+
+            all_action_params = np.asarray(all_action_params, dtype=np.float32).reshape(-1)
+            if all_action_params.size != self.total_param_dim:
+                raise ValueError(
+                    f"Invalid action_params size: got {all_action_params.size}, expected {self.total_param_dim}"
+                )
+
+            # Power parameters for the chosen discrete action (normalized [0, 1])
+            start = discrete_action * self.param_dim_per_action
+            end = start + self.param_dim_per_action
+            power_norm = np.clip(all_action_params[start:end], 0.0, 1.0)
+
+            decoded = discrete_action
             for j in range(self.n_des):
-                a = action[i] % self.action_range
                 channel_last = self.uav_channels[i][j]
-                self.uav_channels[i][j] = int(a % self.n_channel)
-                self.uav_powers[i][j] = self.uav_power_list[a % len(self.uav_power_list)]
-                if (self.uav_channels[i][j] != channel_last):
+                self.uav_channels[i][j] = int(decoded % self.n_channel)
+                self.uav_powers[i][j] = float(
+                    self.uav_power_min + float(power_norm[j]) * (self.uav_power_max - self.uav_power_min)
+                )
+                if self.uav_channels[i][j] != channel_last:
                     self.uav_jump_count[i] += 1
-                action[i] = int(action[i] / self.action_range)
+                decoded = int(decoded / self.n_channel)
 
     def generate_p_trans(self, mode = 1):
         return generate_jammer_p_trans(self.jammer_state_dim, mode=mode)
@@ -745,7 +767,7 @@ class Environ(gym.Env):
         return state
 
     def step(self, a):
-        action = np.array(deepcopy(a), dtype=np.int32)
+        action = deepcopy(a)
         self.decomposition_action(action)
         reward = self.act()
         state_next = self.get_state()  # 得到新的状态

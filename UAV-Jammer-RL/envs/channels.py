@@ -29,10 +29,6 @@ class UAVchannels:
         PL_los = 103.8 + 20.9*np.log10(distance*1e-3)
         return PL_los
 
-    def update_fast_fading(self):
-        h = 1 / np.sqrt(2) * (np.random.normal(size=(self.n_uav, self.n_uav, self.n_channel)) + 1j * np.random.normal(size=(self.n_uav, self.n_uav, self.n_channel)))
-        self.FastFading = 20 * np.log10(np.abs(h))
-
 class Jammerchannels:
     def __init__(self, n_jammer, n_uav, n_channel, BS_position):
         self.h_bs = 25  # BS antenna height
@@ -61,8 +57,3 @@ class Jammerchannels:
         distance = np.sqrt(d1**2 + d2**2 + d3**2) + 0.001
         PL_los = 103.8 + 20.9*np.log10(distance*1e-3)
         return PL_los
-
-    def update_fast_fading(self):
-        h = 1 / np.sqrt(2) * (np.random.normal(size=(self.n_jammer, self.n_uav, self.n_channel)) +
-                              1j * np.random.normal(size=(self.n_jammer, self.n_uav, self.n_channel)))
-        self.FastFading = 20 * np.log10(np.abs(h))

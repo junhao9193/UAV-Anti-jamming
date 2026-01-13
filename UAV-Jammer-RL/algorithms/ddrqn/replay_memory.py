@@ -31,3 +31,6 @@ class ReplayMemory(object):
 
     def is_available(self):
         return len(self.memory) >= self.sample_length
+
+
+__all__ = ["ReplayMemory"]

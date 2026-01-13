@@ -11,7 +11,8 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "high_height": 120,
     "k": 0.8,
     "sigma": 0.2,
-    "uav_power_list": [36, 33, 30, 27, 23],
+    "uav_power_min": 23.0,
+    "uav_power_max": 36.0,
     "jammer_power": 30,
     "sig2_dB": -114,
     "uavAntGain": 3,
@@ -74,4 +75,3 @@ def load_env_config(
         merged.update(config)
 
     return merged
-

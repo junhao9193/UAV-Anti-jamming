@@ -23,3 +23,6 @@ class DDRQN(nn.Module):
         h2 = F.relu(self.fc1(torch.cat((x, h1), dim=2)))
         h3 = F.relu(self.fc2(h2))
         return self.fc3(h3), new_hidden
+
+
+__all__ = ["DDRQN"]

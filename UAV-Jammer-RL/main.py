@@ -3,17 +3,21 @@ from __future__ import division
 import numpy as np
 
 from envs import Environ
-from algorithms import Agent
 
 
-def train(n_episode=1500, n_steps=1000, max_epi_num=200):
-    """DDRQN 训练主函数"""
+def train_mpdqn(n_episode=1500, n_steps=1000):
+    """MP-DQN 训练主函数（信道离散 + 功率连续）"""
     env = Environ()
 
-    # 在外部创建 Agent（解耦后的设计）
+    from algorithms import MPDQNAgent
+
     agents = [
-        Agent(i, env.state_dim, env.action_dim, max_epi_num=max_epi_num, max_epi_len=n_steps)
-        for i in range(env.n_ch)
+        MPDQNAgent(
+            state_dim=env.state_dim,
+            n_actions=env.action_dim,
+            param_dim=env.param_dim_per_action,
+        )
+        for _ in range(env.n_ch)
     ]
 
     epsilon = 1.0
@@ -24,29 +28,29 @@ def train(n_episode=1500, n_steps=1000, max_epi_num=200):
 
     for episode in range(n_episode):
         state = env.reset(env.generate_p_trans())
-        hiddens = [None] * env.n_ch
         episode_reward = 0
 
         for step in range(n_steps):
             actions = []
-            new_hiddens = []
 
-            # 每个 agent 选择动作
             for i in range(env.n_ch):
-                action, new_hidden = agents[i].get_action(state[i], hiddens[i], epsilon)
-                actions.append(action)
-                new_hiddens.append(new_hidden)
+                action_discrete, action_params = agents[i].select_action(state[i], epsilon)
+                actions.append((action_discrete, action_params))
 
-            # 环境执行动作
             next_state, rewards, done, info = env.step(actions)
 
-            # 存储经验并训练
             for i in range(env.n_ch):
-                agents[i].remember(state[i], actions[i], rewards[i], next_state[i])
-                agents[i].train(hiddens[i])
+                agents[i].store(
+                    state=state[i],
+                    action_discrete=actions[i][0],
+                    action_params=actions[i][1],
+                    reward=float(rewards[i]),
+                    next_state=next_state[i],
+                    done=bool(done),
+                )
+                agents[i].train_step()
 
             state = next_state
-            hiddens = new_hiddens
             episode_reward += np.mean(rewards)
 
             if done:
@@ -79,16 +83,5 @@ def test():
     print("Test OK, state_dim:", env.state_dim, "action_dim:", env.action_dim)
 
 
-def get_params(agents):
-    """获取所有 agent 的参数"""
-    return [agent.get_params() for agent in agents]
-
-
-def load_params(agents, params):
-    """加载所有 agent 的参数"""
-    for i, agent in enumerate(agents):
-        agent.load_params(params[i])
-
-
 if __name__ == "__main__":
-    test()
+    train_mpdqn()
