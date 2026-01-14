@@ -6,6 +6,18 @@ from typing import Any
 import numpy as np
 
 
+_TIME_EPS = 1e-9
+
+
+def _dwell_index(t: float, dwell: float) -> int:
+    return int(np.floor((float(t) + _TIME_EPS) / float(dwell)))
+
+
+def _at_dwell_boundary(t: float, dwell: float) -> bool:
+    remainder = float(t) % float(dwell)
+    return (remainder < _TIME_EPS) or (abs(remainder - float(dwell)) < _TIME_EPS)
+
+
 def init_jammer_state(env: Any) -> None:
     if env.type_of_interference == "saopin":
         # self.jammer_channels = random.sample(range(0, self.n_channel), k=self.n_jammer)  #不包括 stop
@@ -25,14 +37,16 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
     env.t_uav += env.t_Rx
     env.t_jammer += env.t_Rx
     # self.jammer_channels_list = []
-    if np.floor_divide((env.t_jammer - env.t_Rx), env.t_dwell) == np.floor_divide(env.t_jammer, env.t_dwell) - 1:
+    prev_dwell = _dwell_index(env.t_jammer - env.t_Rx, env.t_dwell)
+    curr_dwell = _dwell_index(env.t_jammer, env.t_dwell)
+    if prev_dwell == curr_dwell - 1:
         # （干扰机时间-传输时间0.98）/干扰机扫频停留时间2.28 == 干扰机时间/干扰机扫频停留时间 - 1
         if env.type_of_interference == "saopin":
             for i in range(env.n_jammer):
                 env.jammer_channels[i] += env.step_forward
                 env.jammer_channels[i] = int(env.jammer_channels[i] % env.n_channel)
 
-            if env.t_jammer % env.t_dwell == 0:
+            if _at_dwell_boundary(env.t_jammer, env.t_dwell):
                 for i in range(env.n_jammer):
                     env.jammer_channels_list.append((env.jammer_channels[i] + env.n_channel - 1) % env.n_channel)
                     env.jammer_index_list.append(i)
@@ -46,8 +60,7 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
                         (env.jammer_channels[i] + env.n_channel - 1) % env.n_channel
                     )  # jammer_channels[i]-1
                     env.jammer_index_list.append(i)
-                change_times = np.floor_divide(env.t_jammer, env.t_dwell)
-                change_point = change_times * env.t_dwell
+                change_point = curr_dwell * env.t_dwell
 
                 env.jammer_time[0] = env.t_jammer - change_point  # 0对应传输后半段的干扰时间
                 env.jammer_time[1] = env.t_Rx - env.jammer_time[0]
@@ -59,7 +72,7 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
             p = env.p_trans[idx]
             env.jammer_channels = random.choices(env.all_jammer_states_list, weights=p, k=1)[0]
 
-            if env.t_jammer % env.t_dwell == 0:  # 传输完成后切换干扰信道
+            if _at_dwell_boundary(env.t_jammer, env.t_dwell):  # 传输完成后切换干扰信道
                 for i in range(env.n_jammer):
                     env.jammer_channels_list.append(old_jammer_channels[i])
                     env.jammer_index_list.append(i)
@@ -71,8 +84,7 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
                     env.jammer_index_list.append(i)
                     env.jammer_channels_list.append(old_jammer_channels[i])  # jammer_channels[i]-1
                     env.jammer_index_list.append(i)
-                change_times = np.floor_divide(env.t_jammer, env.t_dwell)
-                change_point = change_times * env.t_dwell
+                change_point = curr_dwell * env.t_dwell
 
                 env.jammer_time[0] = env.t_jammer - change_point  # 0对应传输后半段的干扰时间
                 env.jammer_time[1] = env.t_Rx - env.jammer_time[0]
@@ -84,8 +96,8 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
     env.t_uav += env.timestep
     env.t_jammer += env.timestep
     if (
-        np.floor_divide((env.t_jammer - env.timestep), env.t_dwell)
-        == np.floor_divide(env.t_jammer, env.t_dwell) - 1
+        _dwell_index(env.t_jammer - env.timestep, env.t_dwell)
+        == _dwell_index(env.t_jammer, env.t_dwell) - 1
     ):  # 这里是什么意思
         if env.type_of_interference == "saopin":
             for i in range(env.n_jammer):
@@ -138,4 +150,3 @@ def generate_p_trans(jammer_state_dim: int, mode: int = 1) -> np.ndarray:
         for j in range(jammer_state_dim):
             p_trans[i][j] = p_trans[i][j] / p_trans_sum[i]  # 每行归一化
     return p_trans
-

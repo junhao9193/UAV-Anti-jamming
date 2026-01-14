@@ -112,6 +112,10 @@ class Environ(gym.Env):
         # 从而使得干扰机能够最大限度的对agent进行干扰
         self.policy = None  # 对应算法
         self.training = True
+        self.jammer_channels = [0 for _ in range(self.n_jammer)]
+        self.jammer_channels_list = []
+        self.jammer_index_list = []
+        self.jammer_time = np.zeros([2], dtype=np.float32)
 
         self.uav_list = list(np.arange(self.n_uav))
         self.ch_list = random.sample(self.uav_list, k=self.n_ch)#由于随机数种子的原因，每次都选择2、7、3作为簇头
@@ -274,16 +278,6 @@ class Environ(gym.Env):
                 self.jammers[i].jammer_direction.append(start_direction)
                 self.jammers[i].jammer_p.append(start_p)
 
-    def renew_neighbors_of_uavs(self):
-        for i in range(len(self.uavs)):
-            self.uavs[i].neighbors = []
-        z = np.array([[complex(c.position[0], c.position[1], c.position[2]) for c in self.uavs]])
-        Distance = abs(z.T - z)
-        for i in range(len(self.uavs)):
-            sort_idx = np.argsort(Distance[:, i])  # 返回数组值从小到大的索引值
-            for j in range(len(sort_idx)-1):
-                self.uavs[i].neighbors.append(sort_idx[j + 1])
-
     def new_random_game(self):
         # self.all_observed_states()
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
@@ -303,7 +297,6 @@ class Environ(gym.Env):
         self.jammers = []
         self.renew_uavs()       #更新簇头无人机的位置、方向和速度
         self.renew_uav_clusters()       #更新簇头和簇内无人机的位置 并且保证簇内成员与簇头在通信范围内
-        #self.renew_neighbors_of_uavs()
         self.renew_jammers()        #更新干扰机的位置
 
         self.UAVchannels = UAVchannels(self.n_uav, self.n_channel, self.BS_position)
@@ -350,13 +343,14 @@ class Environ(gym.Env):
                         csi_ij = np.clip(csi_ij, -1.0, 1.0)
                     csi[i][j] = csi_ij
             uav_channels = self.uav_channels / self.n_channel
-            uav_powers = self.uav_powers / self.uav_power_max
+            uav_powers = (self.uav_powers - self.uav_power_min) / (self.uav_power_max - self.uav_power_min + 1e-12)
+            uav_powers = np.clip(uav_powers, 0.0, 1.0)
             jammer_channels = np.asarray([x / self.n_channel for x in self.jammer_channels])      #for item in list,获取列表中的每一项
             for i in range(self.n_ch):
                 joint_state.append(np.concatenate((csi[i].reshape([-1]), jammer_channels)).astype(np.float32))
             return joint_state
 
-    def compute_reward(self, i, j, other_channel_list, other_index_list, pairs):
+    def compute_reward(self, i, j, other_channel_list, pairs):
         uav_interference = 0   # 其他的transmitter对transmitter i的干扰
         uav_interference_from_jammer0 = 0    #后半段干扰机干扰
         uav_interference_from_jammer1 = 0   #前半段干扰机干扰
@@ -374,11 +368,14 @@ class Environ(gym.Env):
                 uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, self.uav_channels[i][j]] +
                                             2 * self.uavAntGain - self.uavNoiseFigure) / 10)     #无人机内部干扰
 
-        if self.uav_channels[i][j] in self.jammer_channels_list:
-            idx = np.where(self.jammer_channels_list == self.uav_channels[i][j])
-            if self.jammer_time[0] == self.t_Rx or self.jammer_time[0] == self.t_Rx-self.jammer_start:     # 传输时间干扰机没换信道
-                for m in range(len(idx)):
-                    jammer_idx = self.jammer_index_list[idx[m][0]]
+        jam_arr = np.asarray(self.jammer_channels_list, dtype=np.int32)
+        idx = np.where(jam_arr == self.uav_channels[i][j])[0]
+        if idx.size > 0:
+            time_eps = 1e-9
+            jammer_switched_during_rx = float(self.jammer_time[1]) > time_eps
+            if not jammer_switched_during_rx:     # 传输时间干扰机没换信道
+                for m in idx:
+                    jammer_idx = self.jammer_index_list[m]
                     uav_interference += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
                 uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + self.sig2)))
                 uav_rate *= self.bandwidth
@@ -386,9 +383,9 @@ class Environ(gym.Env):
 
 
             else:    # 传输时间干扰机换了信道，判断干扰了前半段还是后半段
-                for m in range(len(idx)):
-                    jammer_idx = self.jammer_index_list[idx[m][0]]
-                    if idx[m][0] % 2 == 0:   # 后半段(self.jammer_channels_list先存入的后半段干扰信道序号）
+                for m in idx:
+                    jammer_idx = self.jammer_index_list[m]
+                    if m % 2 == 0:   # 后半段(self.jammer_channels_list先存入的后半段干扰信道序号）
                         uav_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
 
@@ -396,9 +393,9 @@ class Environ(gym.Env):
                 uav_rate *= self.bandwidth
                 transmit_time1 = self.data_size / uav_rate
 
-                for l in range(len(idx)):
-                    jammer_idx = self.jammer_index_list[idx[l][0]]
-                    if idx[l][0] % 2 == 1:   # 前半段
+                for m in idx:
+                    jammer_idx = self.jammer_index_list[m]
+                    if m % 2 == 1:   # 前半段
                         uav_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
                 uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + uav_interference_from_jammer1 + self.sig2)))
@@ -441,17 +438,15 @@ class Environ(gym.Env):
         
         while tra < self.n_ch:
             other_channel_list = []
-            other_index_list = []
             pairs = []
             for i in range(self.n_ch):
                 for j in range(self.n_des):
                     if i==tra and j==rec:
                         continue
                     other_channel_list.append(self.uav_channels[i][j])      #排除自己通信信道的其他信道
-                    other_index_list.append(self.uav_pairs[i][j][0])        #排除自己簇头的其他簇头
                     pairs.append([i, j])
 
-            tra_time, suc = self.compute_reward(tra, rec, other_channel_list, other_index_list, pairs)  # 传输时间
+            tra_time, suc = self.compute_reward(tra, rec, other_channel_list, pairs)  # 传输时间
             self.rew_suc += suc
             energy = 10 ** (self.uav_powers[tra][rec] / 10 - 3) * tra_time      # 能量奖励
             self.rew_energy += energy
