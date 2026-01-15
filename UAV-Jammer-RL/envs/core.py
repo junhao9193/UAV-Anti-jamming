@@ -280,6 +280,8 @@ class Environ(gym.Env):
 
     def new_random_game(self):
         # self.all_observed_states()
+        self.t_uav = 0.0
+        self.t_jammer = 0.0
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
         self.uav_channels = np.zeros([self.n_ch, self.n_des], dtype=np.int32)   # 每个智能体观察到的全局动作（假设智能体可以观察到其他智能体已经完成的动作）
         self.uav_powers = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
