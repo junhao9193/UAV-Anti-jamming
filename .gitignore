@@ -3,7 +3,8 @@
 /codex-claude.txt
 /MA-CJD-MARL/
 /MetaRL-for-UAV-Anti-jamming/
-
+/Draw
+/doc
 # Python bytecode
 __pycache__/
 *.pyc
