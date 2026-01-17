@@ -112,7 +112,79 @@ def train_mappo(n_episode=2000, rollout_steps=256):
 
 
 def train_mpdqn(n_episode=1500, n_steps=1000):
-    """MP-DQN 训练主函数（信道离散 + 功率连续）"""
+    """MP-DQN (QMIX) 全局联合训练：team reward + joint replay + mixing network."""
+    env = Environ()
+
+    from algorithms import MPDQNQMIXTrainer
+
+    trainer = MPDQNQMIXTrainer(
+        n_agents=int(env.n_ch),
+        state_dim=int(env.state_dim),
+        n_actions=int(env.action_dim),
+        param_dim=int(env.param_dim_per_action),
+        global_state_dim=int(env.state_dim * env.n_ch),
+    )
+
+    epsilon = 1.0
+    epsilon_min = 0.01
+    epsilon_decay = 0.995
+
+    reward_history = []
+
+    pbar = trange(n_episode, desc="Training(MP-DQN-QMIX)", unit="ep", ascii=True)
+    for episode in pbar:
+        state = env.reset(env.generate_p_trans())
+        episode_reward = 0.0
+        loss_q_sum = 0.0
+        loss_actor_sum = 0.0
+        loss_count = 0
+
+        for step in range(n_steps):
+            actions = trainer.select_actions(state, epsilon)
+
+            next_state, rewards, done, info = env.step(actions)
+
+            trainer.store_transition(
+                states=state,
+                actions=actions,
+                rewards=np.asarray(rewards, dtype=np.float32),
+                next_states=next_state,
+                done=bool(done),
+            )
+            loss_info = trainer.train_step()
+            if loss_info is not None:
+                loss_q_sum += float(loss_info["loss_q"])
+                loss_actor_sum += float(loss_info["loss_actor"])
+                loss_count += 1
+
+            state = next_state
+            episode_reward += np.mean(rewards)
+
+            if done:
+                break
+
+        # 衰减 epsilon
+        if epsilon > epsilon_min:
+            epsilon *= epsilon_decay
+
+        reward_history.append(episode_reward)
+
+        recent_window = min(100, len(reward_history))
+        avg_reward = float(np.mean(reward_history[-recent_window:]))
+        postfix = {
+            "avg_r": f"{avg_reward:.3f}",
+            "eps": f"{epsilon:.3f}",
+        }
+        if loss_count > 0:
+            postfix["loss_q"] = f"{(loss_q_sum / loss_count):.3f}"
+            postfix["loss_a"] = f"{(loss_actor_sum / loss_count):.3f}"
+        pbar.set_postfix(postfix)
+
+    return trainer, reward_history
+
+
+def train_mpdqn_iql(n_episode=1500, n_steps=1000):
+    """MP-DQN (IQL) 训练主函数（每个 agent 独立学习）。"""
     env = Environ()
 
     from algorithms import MPDQNAgent
@@ -132,7 +204,7 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
 
     reward_history = []
 
-    pbar = trange(n_episode, desc="Training", unit="ep", ascii=True)
+    pbar = trange(n_episode, desc="Training(MP-DQN-IQL)", unit="ep", ascii=True)
     for episode in pbar:
         state = env.reset(env.generate_p_trans())
         episode_reward = 0.0
@@ -170,7 +242,6 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
             if done:
                 break
 
-        # 衰减 epsilon
         if epsilon > epsilon_min:
             epsilon *= epsilon_decay
 

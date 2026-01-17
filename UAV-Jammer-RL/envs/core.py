@@ -92,6 +92,9 @@ class Environ(gym.Env):
         self.p_md = cfg["p_md"]  # 漏警概率
         self.p_fa = cfg["p_fa"]  # 虚警概率
         self.pn0 = cfg["pn0"]  # 数据包长度
+        self.sensing_w_jammer = float(cfg.get("sensing_w_jammer", 1.0))
+        self.sensing_w_uav = float(cfg.get("sensing_w_uav", 1.0))
+        self.sensing_noise_std = float(cfg.get("sensing_noise_std", 0.0))
 
         self.max_distance1 = cfg["max_distance1"]
         self.max_distance2 = cfg["max_distance2"]
@@ -334,22 +337,64 @@ class Environ(gym.Env):
 
         else:
             joint_state = []
-            csi = np.zeros([self.n_ch, self.n_des, self.n_channel])
+            # CSI 压缩：路径损耗不区分信道，每条链路只需一个值
+            csi = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
 
             for i in range(self.n_ch):
                 for j in range(self.n_des):
-                    tra_id = self.uav_pairs[i][j][0]        # 接收机和发射机
-                    rec_id = self.uav_pairs[i][j][1]
-                    csi_ij = (self.UAVchannels_loss_db[tra_id][rec_id] - self.csi_pathloss_offset) / self.csi_pathloss_scale
+                    tra_id = self.uav_pairs[i][j][0]        # 发射机
+                    rec_id = self.uav_pairs[i][j][1]        # 接收机
+                    # 路径损耗不区分信道，取第一个信道的值（所有信道相同）
+                    pathloss = self.UAVchannels_loss_db[tra_id][rec_id][0]
+                    csi_ij = (pathloss - self.csi_pathloss_offset) / self.csi_pathloss_scale
                     if self.csi_clip:
                         csi_ij = np.clip(csi_ij, -1.0, 1.0)
                     csi[i][j] = csi_ij
-            uav_channels = self.uav_channels / self.n_channel
-            uav_powers = (self.uav_powers - self.uav_power_min) / (self.uav_power_max - self.uav_power_min + 1e-12)
-            uav_powers = np.clip(uav_powers, 0.0, 1.0)
-            jammer_channels = np.asarray([x / self.n_channel for x in self.jammer_channels])      #for item in list,获取列表中的每一项
+
+            # 频谱感知：连续的“信道能量图”作为观测（不采样成 0/1）
+            # z_i(c) = w_J * I[c in C^J] + w_U * sum_{k!=i} I[c in C^k] + noise
+            # 再做 z-score 标准化并 clip 到 [-1,1]，训练更稳定。
+            if not isinstance(self.jammer_channels, list):
+                jammer_ch_list = list(self.jammer_channels)
+            else:
+                jammer_ch_list = self.jammer_channels
+
+            jammer_set = set(map(int, jammer_ch_list))
+            other_used_sets = [set(map(int, self.uav_channels[k].reshape(-1).tolist())) for k in range(self.n_ch)]
+
             for i in range(self.n_ch):
-                joint_state.append(np.concatenate((csi[i].reshape([-1]), jammer_channels)).astype(np.float32))
+                z = np.zeros([self.n_channel], dtype=np.float32)
+
+                # jammer 占用
+                if jammer_set:
+                    z[np.asarray(list(jammer_set), dtype=np.int32)] += float(self.sensing_w_jammer)
+
+                # 其他簇头占用（按簇头计数，不按 link 计数）
+                for k in range(self.n_ch):
+                    if k == i:
+                        continue
+                    used = other_used_sets[k]
+                    if used:
+                        z[np.asarray(list(used), dtype=np.int32)] += float(self.sensing_w_uav)
+
+                # 可选：感知噪声（默认 0，不引入随机性）
+                if self.sensing_noise_std > 0.0:
+                    z += np.random.normal(0.0, self.sensing_noise_std, size=self.n_channel).astype(np.float32)
+
+                mu = float(np.mean(z))
+                std = float(np.std(z))
+                if std < 1e-6:
+                    z_norm = np.zeros_like(z, dtype=np.float32)
+                else:
+                    z_norm = (z - mu) / (std + 1e-12)
+                channel_sensing = np.clip(z_norm, -1.0, 1.0).astype(np.float32)
+
+                # 观测 = [CSI(n_des), 频谱感知(n_channel)]
+                obs_i = np.concatenate([
+                    csi[i],                    # CSI: n_des
+                    channel_sensing,           # 频谱感知: n_channel
+                ]).astype(np.float32)
+                joint_state.append(obs_i)
             return joint_state
 
     def compute_reward(self, i, j, other_channel_list, pairs):
