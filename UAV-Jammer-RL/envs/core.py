@@ -59,6 +59,8 @@ class Environ(gym.Env):
         self.uavNoiseFigure = cfg["uavNoiseFigure"]  # dB    uav receiver noise figure
         self.jammerAntGain = cfg["jammerAntGain"]  # dBi       jammer antenna gain
         self.bandwidth = cfg["bandwidth"]  # Hz
+        # Difficulty knob: scale UAV-UAV interference term in SINR denominator.
+        self.uav_interference_scale = float(cfg.get("uav_interference_scale", 1.0))
 
         #数据传输过程的参数
         self.data_size = cfg["data_size"]
@@ -95,6 +97,42 @@ class Environ(gym.Env):
         self.sensing_w_jammer = float(cfg.get("sensing_w_jammer", 1.0))
         self.sensing_w_uav = float(cfg.get("sensing_w_uav", 1.0))
         self.sensing_noise_std = float(cfg.get("sensing_noise_std", 0.0))
+        self.sensing_jammer_range = float(cfg.get("sensing_jammer_range", 1e9))
+        self.sensing_uav_range = float(cfg.get("sensing_uav_range", 1e9))
+
+        channel_loss_cfg = cfg.get("channel_loss_db", None)
+        if channel_loss_cfg is None:
+            self.channel_loss_db = np.zeros((int(self.n_channel),), dtype=np.float32)
+        else:
+            self.channel_loss_db = np.asarray(channel_loss_cfg, dtype=np.float32).reshape(-1)
+            if self.channel_loss_db.size != int(self.n_channel):
+                raise ValueError(
+                    f"channel_loss_db length must equal n_channel ({self.n_channel}), got {self.channel_loss_db.size}"
+                )
+
+        # Link-level frequency selectivity (static across the whole run when seed is fixed).
+        # This is NOT fast fading (no per-step randomness), but makes different links prefer different channels.
+        self.channel_selectivity_std_db = float(cfg.get("channel_selectivity_std_db", 0.0))
+        self.channel_selectivity_seed = int(cfg.get("channel_selectivity_seed", 0))
+        if self.channel_selectivity_std_db <= 0.0:
+            self.uav_channel_selectivity_db = np.zeros(
+                (int(self.n_uav), int(self.n_uav), int(self.n_channel)), dtype=np.float32
+            )
+            self.jammer_channel_selectivity_db = np.zeros(
+                (int(self.n_jammer), int(self.n_uav), int(self.n_channel)), dtype=np.float32
+            )
+        else:
+            rng = np.random.default_rng(self.channel_selectivity_seed)
+            self.uav_channel_selectivity_db = rng.normal(
+                0.0,
+                self.channel_selectivity_std_db,
+                size=(int(self.n_uav), int(self.n_uav), int(self.n_channel)),
+            ).astype(np.float32)
+            self.jammer_channel_selectivity_db = rng.normal(
+                0.0,
+                self.channel_selectivity_std_db,
+                size=(int(self.n_jammer), int(self.n_uav), int(self.n_channel)),
+            ).astype(np.float32)
 
         self.max_distance1 = cfg["max_distance1"]
         self.max_distance2 = cfg["max_distance2"]
@@ -105,6 +143,8 @@ class Environ(gym.Env):
         self.p_trans_mode = cfg["p_trans_mode"]
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
+        self.fairness_min_success_rate = float(cfg.get("fairness_min_success_rate", 0.0))
+        self.fairness_weight = float(cfg.get("fairness_weight", 0.0))
         self.csi_pathloss_offset = float(cfg.get("csi_pathloss_offset", 80.0))
         self.csi_pathloss_scale = float(cfg.get("csi_pathloss_scale", 60.0))
         self.csi_clip = bool(cfg.get("csi_clip", True))
@@ -337,19 +377,19 @@ class Environ(gym.Env):
 
         else:
             joint_state = []
-            # CSI 压缩：路径损耗不区分信道，每条链路只需一个值
-            csi = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
+            # CSI：每条链路在每个信道上的大尺度 CSI（路径损耗 + 信道固定差异/选择性），不引入快衰落。
+            # 形状: (n_ch, n_des, n_channel)
+            csi = np.zeros([self.n_ch, self.n_des, self.n_channel], dtype=np.float32)
 
             for i in range(self.n_ch):
                 for j in range(self.n_des):
                     tra_id = self.uav_pairs[i][j][0]        # 发射机
                     rec_id = self.uav_pairs[i][j][1]        # 接收机
-                    # 路径损耗不区分信道，取第一个信道的值（所有信道相同）
-                    pathloss = self.UAVchannels_loss_db[tra_id][rec_id][0]
-                    csi_ij = (pathloss - self.csi_pathloss_offset) / self.csi_pathloss_scale
+                    pathloss_vec = self.UAVchannels_loss_db[tra_id, rec_id, :].astype(np.float32)  # (n_channel,)
+                    csi_ij = (pathloss_vec - self.csi_pathloss_offset) / self.csi_pathloss_scale
                     if self.csi_clip:
                         csi_ij = np.clip(csi_ij, -1.0, 1.0)
-                    csi[i][j] = csi_ij
+                    csi[i, j, :] = csi_ij
 
             # 频谱感知：连续的“信道能量图”作为观测（不采样成 0/1）
             # z_i(c) = w_J * I[c in C^J] + w_U * sum_{k!=i} I[c in C^k] + noise
@@ -359,19 +399,37 @@ class Environ(gym.Env):
             else:
                 jammer_ch_list = self.jammer_channels
 
-            jammer_set = set(map(int, jammer_ch_list))
             other_used_sets = [set(map(int, self.uav_channels[k].reshape(-1).tolist())) for k in range(self.n_ch)]
+
+            # Range clipping: each cluster head only "sees" nearby jammers / nearby other cluster heads.
+            ch_tx_ids = np.asarray([int(self.uav_pairs[k][0][0]) for k in range(self.n_ch)], dtype=np.int32)
+            ch_positions = np.asarray([self.uavs[idx].position for idx in ch_tx_ids], dtype=np.float32)  # (n_ch,3)
+            jammer_positions = (
+                np.asarray([j.position for j in self.jammers], dtype=np.float32) if len(self.jammers) > 0 else None
+            )
 
             for i in range(self.n_ch):
                 z = np.zeros([self.n_channel], dtype=np.float32)
 
-                # jammer 占用
-                if jammer_set:
-                    z[np.asarray(list(jammer_set), dtype=np.int32)] += float(self.sensing_w_jammer)
+                # jammer 占用（仅统计探测范围内的 jammer）
+                jammer_set_i = set()
+                if jammer_positions is None:
+                    jammer_set_i = set(map(int, jammer_ch_list))
+                else:
+                    d_j = np.linalg.norm(jammer_positions - ch_positions[i], axis=1)  # (n_jammer,)
+                    for jammer_idx, ch in enumerate(jammer_ch_list):
+                        if jammer_idx < d_j.shape[0] and float(d_j[jammer_idx]) <= float(self.sensing_jammer_range):
+                            jammer_set_i.add(int(ch))
+
+                if jammer_set_i:
+                    z[np.asarray(list(jammer_set_i), dtype=np.int32)] += float(self.sensing_w_jammer)
 
                 # 其他簇头占用（按簇头计数，不按 link 计数）
+                d_ch = np.linalg.norm(ch_positions - ch_positions[i], axis=1)  # (n_ch,)
                 for k in range(self.n_ch):
                     if k == i:
+                        continue
+                    if float(d_ch[k]) > float(self.sensing_uav_range):
                         continue
                     used = other_used_sets[k]
                     if used:
@@ -389,18 +447,18 @@ class Environ(gym.Env):
                     z_norm = (z - mu) / (std + 1e-12)
                 channel_sensing = np.clip(z_norm, -1.0, 1.0).astype(np.float32)
 
-                # 观测 = [CSI(n_des), 频谱感知(n_channel)]
+                # 观测 = [CSI(n_des*n_channel), 频谱感知(n_channel)]
                 obs_i = np.concatenate([
-                    csi[i],                    # CSI: n_des
+                    csi[i].reshape(-1),         # CSI: (n_des*n_channel,)
                     channel_sensing,           # 频谱感知: n_channel
                 ]).astype(np.float32)
                 joint_state.append(obs_i)
             return joint_state
 
     def compute_reward(self, i, j, other_channel_list, pairs):
-        uav_interference = 0   # 其他的transmitter对transmitter i的干扰
-        uav_interference_from_jammer0 = 0    #后半段干扰机干扰
-        uav_interference_from_jammer1 = 0   #前半段干扰机干扰
+        uav_uav_interference = 0.0   # interference from other UAV transmitters (linear mW)
+        jammer_interference_from_jammer0 = 0.0    #后半段干扰机干扰
+        jammer_interference_from_jammer1 = 0.0   #前半段干扰机干扰
 
         transmitter_idx = self.uav_pairs[i][j][0]
         receiver_idx = self.uav_pairs[i][j][1]
@@ -412,8 +470,10 @@ class Environ(gym.Env):
             for k in range(len(index[0])):
                 ii, jj = pairs[index[0][k]]
                 interferer_tx_idx = self.uav_pairs[ii][jj][0]
-                uav_interference += 10 ** ((self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, self.uav_channels[i][j]] +
-                                            2 * self.uavAntGain - self.uavNoiseFigure) / 10)     #无人机内部干扰
+                uav_uav_interference += 10 ** (
+                    (self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, self.uav_channels[i][j]]
+                     + 2 * self.uavAntGain - self.uavNoiseFigure) / 10
+                )     #无人机内部干扰
 
         jam_arr = np.asarray(self.jammer_channels_list, dtype=np.int32)
         idx = np.where(jam_arr == self.uav_channels[i][j])[0]
@@ -421,10 +481,15 @@ class Environ(gym.Env):
             time_eps = 1e-9
             jammer_switched_during_rx = float(self.jammer_time[1]) > time_eps
             if not jammer_switched_during_rx:     # 传输时间干扰机没换信道
+                jammer_interference = 0.0
                 for m in idx:
                     jammer_idx = self.jammer_index_list[m]
-                    uav_interference += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
-                uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + self.sig2)))
+                    jammer_interference += 10 ** (
+                        (self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]]
+                         + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10
+                    )
+                denom = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference) + float(self.sig2)
+                uav_rate = np.log2(1 + np.divide(uav_signal, denom))
                 uav_rate *= self.bandwidth
                 transmit_time = self.data_size / uav_rate
 
@@ -433,19 +498,21 @@ class Environ(gym.Env):
                 for m in idx:
                     jammer_idx = self.jammer_index_list[m]
                     if m % 2 == 0:   # 后半段(self.jammer_channels_list先存入的后半段干扰信道序号）
-                        uav_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
+                        jammer_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
 
-                uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + uav_interference_from_jammer0 + self.sig2)))
+                denom0 = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference_from_jammer0) + float(self.sig2)
+                uav_rate = np.log2(1 + np.divide(uav_signal, denom0))
                 uav_rate *= self.bandwidth
                 transmit_time1 = self.data_size / uav_rate
 
                 for m in idx:
                     jammer_idx = self.jammer_index_list[m]
                     if m % 2 == 1:   # 前半段
-                        uav_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
+                        jammer_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
                                                                  self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
-                uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + uav_interference_from_jammer1 + self.sig2)))
+                denom1 = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference_from_jammer1) + float(self.sig2)
+                uav_rate = np.log2(1 + np.divide(uav_signal, denom1))
                 uav_rate *= self.bandwidth
                 transmit_time2 = self.data_size / uav_rate
 
@@ -456,7 +523,8 @@ class Environ(gym.Env):
                     transmit_time = transmit_time2
 
         else:
-            uav_rate = np.log2(1 + np.divide(uav_signal, (uav_interference + self.sig2)))
+            denom = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(self.sig2)
+            uav_rate = np.log2(1 + np.divide(uav_signal, denom))
             uav_rate *= self.bandwidth
             transmit_time = self.data_size / uav_rate
         suc = 0
@@ -482,6 +550,7 @@ class Environ(gym.Env):
 
         tra = 0
         rec = 0
+        success_cnt = np.zeros([self.n_ch], dtype=np.float32)
         
         while tra < self.n_ch:
             other_channel_list = []
@@ -495,6 +564,8 @@ class Environ(gym.Env):
 
             tra_time, suc = self.compute_reward(tra, rec, other_channel_list, pairs)  # 传输时间
             self.rew_suc += suc
+            if suc == 1:
+                success_cnt[tra] += 1.0
             energy = 10 ** (self.uav_powers[tra][rec] / 10 - 3) * tra_time      # 能量奖励
             self.rew_energy += energy
             jump = self.uav_jump_count[tra] # 跳频开销
@@ -509,6 +580,13 @@ class Environ(gym.Env):
             if rec == self.n_des:
                 tra += 1
                 rec = 0
+
+        # Fairness: penalize the whole team if any cluster falls below a minimum success rate.
+        if float(self.fairness_weight) > 0.0 and float(self.fairness_min_success_rate) > 0.0:
+            success_rate_per_cluster = success_cnt / float(self.n_des)
+            shortfall = np.maximum(0.0, float(self.fairness_min_success_rate) - success_rate_per_cluster)
+            team_penalty = float(self.fairness_weight) * float(np.mean(shortfall))
+            uav_rewards -= team_penalty
 
         self.jammer_channels_list = []
         self.jammer_index_list = []
@@ -763,8 +841,16 @@ class Environ(gym.Env):
         self.Jammerchannels.update_pathloss()
         self.UAVchannels.update_pathloss()
         uav_channels_loss_db = np.repeat(self.UAVchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
+        uav_channels_loss_db = (
+            uav_channels_loss_db + self.channel_loss_db.reshape(1, 1, -1) + self.uav_channel_selectivity_db
+        )
         self.UAVchannels_loss_db = uav_channels_loss_db
         jammer_channels_loss_db = np.repeat(self.Jammerchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
+        jammer_channels_loss_db = (
+            jammer_channels_loss_db
+            + self.channel_loss_db.reshape(1, 1, -1)
+            + self.jammer_channel_selectivity_db
+        )
         self.Jammerchannels_loss_db = jammer_channels_loss_db
 
     def act(self):

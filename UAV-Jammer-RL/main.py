@@ -1,5 +1,9 @@
 from __future__ import division
 
+import os
+import json
+from datetime import datetime
+
 import numpy as np
 
 from envs import Environ
@@ -111,7 +115,7 @@ def train_mappo(n_episode=2000, rollout_steps=256):
     return agent, reward_history
 
 
-def train_mpdqn(n_episode=1500, n_steps=1000):
+def train_mpdqn(n_episode=1500, n_steps=1000, save_data=True):
     """MP-DQN (QMIX) 全局联合训练：team reward + joint replay + mixing network."""
     env = Environ()
 
@@ -129,15 +133,21 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
     epsilon_min = 0.01
     epsilon_decay = 0.995
 
+    # 记录训练数据
     reward_history = []
+    success_rate_history = []
+    energy_history = []
+    jump_history = []
 
     pbar = trange(n_episode, desc="Training(MP-DQN-QMIX)", unit="ep", ascii=True)
     for episode in pbar:
         state = env.reset(env.generate_p_trans())
+        env.clear_reward()  # 清空累积奖励
         episode_reward = 0.0
         loss_q_sum = 0.0
         loss_actor_sum = 0.0
         loss_count = 0
+        steps_done = 0
 
         for step in range(n_steps):
             actions = trainer.select_actions(state, epsilon)
@@ -159,20 +169,37 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
 
             state = next_state
             episode_reward += np.mean(rewards)
+            steps_done += 1
 
             if done:
                 break
+
+        # 获取本 episode 的详细指标
+        steps_done = max(1, int(steps_done))
+        total_links = float(steps_done * int(env.n_ch) * int(env.n_des))
+
+        avg_energy = float(env.rew_energy) / total_links
+        avg_jump = float(env.rew_jump) / total_links
+        avg_suc_per_link = float(env.rew_suc) / total_links
+
+        # 成功率映射
+        success_rate = float(np.clip((avg_suc_per_link + 3.0) / 4.0, 0.0, 1.0))
 
         # 衰减 epsilon
         if epsilon > epsilon_min:
             epsilon *= epsilon_decay
 
         reward_history.append(episode_reward)
+        success_rate_history.append(success_rate)
+        energy_history.append(avg_energy)
+        jump_history.append(avg_jump)
 
         recent_window = min(100, len(reward_history))
         avg_reward = float(np.mean(reward_history[-recent_window:]))
+        avg_sr = float(np.mean(success_rate_history[-recent_window:]))
         postfix = {
             "avg_r": f"{avg_reward:.3f}",
+            "sr": f"{avg_sr:.3f}",
             "eps": f"{epsilon:.3f}",
         }
         if loss_count > 0:
@@ -180,10 +207,27 @@ def train_mpdqn(n_episode=1500, n_steps=1000):
             postfix["loss_a"] = f"{(loss_actor_sum / loss_count):.3f}"
         pbar.set_postfix(postfix)
 
-    return trainer, reward_history
+    # 保存训练数据
+    if save_data:
+        save_training_data(
+            algorithm="mpdqn_qmix",
+            reward_history=reward_history,
+            success_rate_history=success_rate_history,
+            energy_history=energy_history,
+            jump_history=jump_history,
+            n_episode=n_episode,
+            n_steps=n_steps,
+        )
+
+    return trainer, {
+        "reward": reward_history,
+        "success_rate": success_rate_history,
+        "energy": energy_history,
+        "jump": jump_history,
+    }
 
 
-def train_mpdqn_iql(n_episode=1500, n_steps=1000):
+def train_mpdqn_iql(n_episode=1500, n_steps=1000, save_data=True):
     """MP-DQN (IQL) 训练主函数（每个 agent 独立学习）。"""
     env = Environ()
 
@@ -202,15 +246,21 @@ def train_mpdqn_iql(n_episode=1500, n_steps=1000):
     epsilon_min = 0.01
     epsilon_decay = 0.995
 
+    # 记录训练数据
     reward_history = []
+    success_rate_history = []
+    energy_history = []
+    jump_history = []
 
     pbar = trange(n_episode, desc="Training(MP-DQN-IQL)", unit="ep", ascii=True)
     for episode in pbar:
         state = env.reset(env.generate_p_trans())
+        env.clear_reward()  # 清空累积奖励
         episode_reward = 0.0
         loss_q_sum = 0.0
         loss_actor_sum = 0.0
         loss_count = 0
+        steps_done = 0
 
         for step in range(n_steps):
             actions = []
@@ -238,19 +288,36 @@ def train_mpdqn_iql(n_episode=1500, n_steps=1000):
 
             state = next_state
             episode_reward += np.mean(rewards)
+            steps_done += 1
 
             if done:
                 break
+
+        # 获取本 episode 的详细指标（按“每条链路每步”平均，避免随 n_steps 线性增长）
+        steps_done = max(1, int(steps_done))
+        total_links = float(steps_done * int(env.n_ch) * int(env.n_des))
+
+        avg_energy = float(env.rew_energy) / total_links
+        avg_jump = float(env.rew_jump) / total_links
+        avg_suc_per_link = float(env.rew_suc) / total_links  # 理论范围 [-3, 1]
+
+        # 成功率映射：suc=1(成功), suc=-3(失败) => success_rate = (avg_suc + 3)/4 ∈ [0,1]
+        success_rate = float(np.clip((avg_suc_per_link + 3.0) / 4.0, 0.0, 1.0))
 
         if epsilon > epsilon_min:
             epsilon *= epsilon_decay
 
         reward_history.append(episode_reward)
+        success_rate_history.append(success_rate)
+        energy_history.append(avg_energy)
+        jump_history.append(avg_jump)
 
         recent_window = min(100, len(reward_history))
         avg_reward = float(np.mean(reward_history[-recent_window:]))
+        avg_sr = float(np.mean(success_rate_history[-recent_window:]))
         postfix = {
             "avg_r": f"{avg_reward:.3f}",
+            "sr": f"{avg_sr:.3f}",
             "eps": f"{epsilon:.3f}",
         }
         if loss_count > 0:
@@ -258,7 +325,138 @@ def train_mpdqn_iql(n_episode=1500, n_steps=1000):
             postfix["loss_a"] = f"{(loss_actor_sum / loss_count):.3f}"
         pbar.set_postfix(postfix)
 
-    return agents, reward_history
+    # 保存训练数据
+    if save_data:
+        save_training_data(
+            algorithm="mpdqn_iql",
+            reward_history=reward_history,
+            success_rate_history=success_rate_history,
+            energy_history=energy_history,
+            jump_history=jump_history,
+            n_episode=n_episode,
+            n_steps=n_steps,
+        )
+
+    return agents, {
+        "reward": reward_history,
+        "success_rate": success_rate_history,
+        "energy": energy_history,
+        "jump": jump_history,
+    }
+
+
+def save_training_data(
+    algorithm,
+    reward_history,
+    success_rate_history,
+    energy_history,
+    jump_history,
+    n_episode,
+    n_steps,
+):
+    """保存训练数据到 Draw/experiment-data 目录"""
+    # 获取项目根目录
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    data_dir = os.path.join(project_root, "Draw", "experiment-data")
+
+    # 创建目录
+    os.makedirs(data_dir, exist_ok=True)
+
+    # 生成时间戳
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{algorithm}_{timestamp}.json"
+    filepath = os.path.join(data_dir, filename)
+
+    # 构建数据
+    data = {
+        "algorithm": algorithm,
+        "timestamp": timestamp,
+        "config": {
+            "n_episode": n_episode,
+            "n_steps": n_steps,
+        },
+        "metrics": {
+            "reward": [float(x) for x in reward_history],
+            "success_rate": [float(x) for x in success_rate_history],
+            "energy": [float(x) for x in energy_history],
+            "jump": [float(x) for x in jump_history],
+        },
+    }
+
+    # 保存 JSON
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    # 同时保存为 numpy 格式方便绘图
+    np_filepath = os.path.join(data_dir, f"{algorithm}_{timestamp}.npz")
+    np.savez(
+        np_filepath,
+        reward=np.array(reward_history),
+        success_rate=np.array(success_rate_history),
+        energy=np.array(energy_history),
+        jump=np.array(jump_history),
+    )
+
+    print(f"Training data saved to:")
+    print(f"  JSON: {filepath}")
+    print(f"  NPZ:  {np_filepath}")
+
+    # 同步保存一张关键指标图（奖励 + 成功率）
+    try:
+        save_path = os.path.join(data_dir, f"{algorithm}_{timestamp}.png")
+        _plot_metrics_png(
+            reward=np.asarray(reward_history, dtype=np.float32),
+            success_rate=np.asarray(success_rate_history, dtype=np.float32),
+            algorithm=algorithm,
+            save_path=save_path,
+        )
+        print(f"  PNG:  {save_path}")
+    except Exception as e:
+        # 绘图失败不影响训练数据落盘
+        print(f"Plot skipped: {e}")
+
+    return filepath, np_filepath
+
+
+def _plot_metrics_png(reward: np.ndarray, success_rate: np.ndarray, algorithm: str, save_path: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def smooth(x: np.ndarray, window: int = 50) -> np.ndarray:
+        if window <= 1 or len(x) < window:
+            return x
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        smoothed = np.convolve(x, kernel, mode="valid")
+        pad = len(x) - len(smoothed)
+        return np.concatenate([x[:pad], smoothed])
+
+    episodes = np.arange(len(reward))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle(f"Training Metrics - {algorithm}", fontsize=12)
+
+    axes[0].plot(episodes, reward, alpha=0.25, color="blue", label="Raw")
+    axes[0].plot(episodes, smooth(reward), color="blue", linewidth=2, label="Smoothed")
+    axes[0].set_xlabel("Episode")
+    axes[0].set_ylabel("Episode Reward")
+    axes[0].set_title("Reward")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(episodes, success_rate, alpha=0.25, color="green", label="Raw")
+    axes[1].plot(episodes, smooth(success_rate), color="green", linewidth=2, label="Smoothed")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("Success Rate")
+    axes[1].set_title("Communication Success Rate")
+    axes[1].set_ylim([0.0, 1.05])
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def test():
@@ -276,4 +474,5 @@ def test():
 
 
 if __name__ == "__main__":
-    train_mappo()
+    # 默认运行 MP-DQN QMIX 训练
+    trainer, metrics = train_mpdqn(n_episode=1500, n_steps=1000, save_data=True)
