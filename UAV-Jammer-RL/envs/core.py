@@ -141,6 +141,7 @@ class Environ(gym.Env):
         self.type_of_interference = cfg["type_of_interference"]
         self.step_forward = cfg["step_forward"]
         self.p_trans_mode = cfg["p_trans_mode"]
+        self.p_trans_seed = int(cfg.get("p_trans_seed", 0))
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
         self.fairness_min_success_rate = float(cfg.get("fairness_min_success_rate", 0.0))

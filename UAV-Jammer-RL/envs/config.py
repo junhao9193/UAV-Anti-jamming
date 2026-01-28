@@ -49,6 +49,8 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "type_of_interference": "markov",
     "step_forward": 1,
     "p_trans_mode": 1,
+    # Fix Markov transition matrix generation across runs (for fair IQL vs QMIX comparison).
+    "p_trans_seed": 0,
     "reward_energy_weight": 1.0,
     "reward_jump_weight": 0.1,
     # Fairness (team penalty): if any cluster's success rate < threshold, penalize the whole team.
