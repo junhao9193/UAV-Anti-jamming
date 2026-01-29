@@ -24,15 +24,17 @@ def save_training_data(
     n_episode: int,
     n_steps: int,
 ) -> Tuple[str, str]:
-    """Save metrics to `Draw/experiment-data` under repo root (json + npz + png)."""
+    """Save metrics to `Draw/experiment-data/{algorithm}_{timestamp}/` under repo root (json + npz + png)."""
     repo_root = get_repo_root()
-    data_dir = repo_root / "Draw" / "experiment-data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    base_dir = repo_root / "Draw" / "experiment-data"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = data_dir / f"{algorithm}_{timestamp}.json"
-    npz_path = data_dir / f"{algorithm}_{timestamp}.npz"
-    png_path = data_dir / f"{algorithm}_{timestamp}.png"
+    data_dir = base_dir / f"{algorithm}_{timestamp}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = data_dir / "training_data.json"
+    npz_path = data_dir / "training_data.npz"
+    png_path = data_dir / "training_metrics.png"
 
     data = {
         "algorithm": algorithm,
