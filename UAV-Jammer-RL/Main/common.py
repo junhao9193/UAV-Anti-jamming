@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -133,5 +134,129 @@ def make_fixed_p_trans(env) -> np.ndarray:
         np.random.set_state(rng_state)
     return np.asarray(p_trans, dtype=np.float32)
 
+def _env_worker(remote, parent_remote, config_path: Optional[str], p_trans: Optional[np.ndarray]) -> None:
+    """
+    Subprocess worker for environment stepping.
 
-__all__ = ["get_repo_root", "save_training_data", "make_fixed_p_trans"]
+    Important: keep imports inside the worker so that starting many workers does not import torch/CUDA.
+    """
+    import os
+
+    # Avoid BLAS thread oversubscription when using many workers.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    parent_remote.close()
+    try:
+        from envs import Environ
+
+        env = Environ(config_path=config_path) if config_path else Environ()
+        if p_trans is not None:
+            env.set_p(p_trans)
+
+        while True:
+            cmd, data = remote.recv()
+            if cmd == "reset":
+                if data is not None:
+                    env.set_p(data)
+                env.new_random_game()
+                env.clear_reward()
+                state = env.get_state()
+                remote.send(np.stack(state, axis=0).astype(np.float32))
+            elif cmd == "step":
+                next_state, reward, done, info = env.step(data)
+                remote.send(
+                    (
+                        np.stack(next_state, axis=0).astype(np.float32),
+                        np.asarray(reward, dtype=np.float32),
+                        bool(done),
+                        info,
+                    )
+                )
+            elif cmd == "metrics":
+                remote.send((float(env.rew_energy), float(env.rew_jump), float(env.rew_suc)))
+            elif cmd == "close":
+                remote.close()
+                break
+            else:
+                raise RuntimeError(f"Unknown cmd: {cmd!r}")
+    except KeyboardInterrupt:
+        pass
+
+
+class SubprocVecEnv:
+    """A minimal subprocess vectorized env wrapper for throughput (sync step)."""
+
+    def __init__(
+        self,
+        n_envs: int,
+        *,
+        config_path: Optional[str] = None,
+        p_trans: Optional[np.ndarray] = None,
+        start_method: str = "spawn",
+    ) -> None:
+        self.n_envs = int(n_envs)
+        if self.n_envs <= 0:
+            raise ValueError("n_envs must be positive")
+
+        ctx = mp.get_context(start_method)
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(self.n_envs)])
+        self.ps = []
+        for work_remote, remote in zip(self.work_remotes, self.remotes):
+            p = ctx.Process(target=_env_worker, args=(work_remote, remote, config_path, p_trans), daemon=True)
+            p.start()
+            self.ps.append(p)
+            work_remote.close()
+
+    def reset(self, p_trans: Optional[np.ndarray] = None) -> np.ndarray:
+        for remote in self.remotes:
+            remote.send(("reset", p_trans))
+        states = [remote.recv() for remote in self.remotes]
+        return np.stack(states, axis=0).astype(np.float32)  # (E, N, S)
+
+    def step_async(self, actions: Sequence[Any]) -> None:
+        if len(actions) != self.n_envs:
+            raise ValueError(f"Expected actions for {self.n_envs} envs, got {len(actions)}")
+        for remote, act in zip(self.remotes, actions):
+            remote.send(("step", act))
+
+    def step_wait(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+        results = [remote.recv() for remote in self.remotes]
+        next_states, rewards, dones, infos = zip(*results)
+        return (
+            np.stack(next_states, axis=0).astype(np.float32),  # (E,N,S)
+            np.stack(rewards, axis=0).astype(np.float32),  # (E,N)
+            np.asarray(dones, dtype=np.bool_),  # (E,)
+            list(infos),
+        )
+
+    def step(self, actions: Sequence[Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+        self.step_async(actions)
+        return self.step_wait()
+
+    def get_metrics(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        for remote in self.remotes:
+            remote.send(("metrics", None))
+        energy, jump, suc = zip(*(remote.recv() for remote in self.remotes))
+        return (
+            np.asarray(energy, dtype=np.float32),
+            np.asarray(jump, dtype=np.float32),
+            np.asarray(suc, dtype=np.float32),
+        )
+
+    def close(self) -> None:
+        for remote in self.remotes:
+            try:
+                remote.send(("close", None))
+            except Exception:
+                pass
+        for p in self.ps:
+            try:
+                p.join(timeout=1.0)
+            except Exception:
+                pass
+
+
+__all__ = ["get_repo_root", "save_training_data", "make_fixed_p_trans", "SubprocVecEnv"]

@@ -16,9 +16,6 @@ import numpy as np
 from scipy.special import comb, perm
 from itertools import combinations, permutations
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 from envs.channels import UAVchannels, Jammerchannels
 from envs.config import load_env_config
 from envs.entities import UAV, Jammer, RP
@@ -142,6 +139,7 @@ class Environ(gym.Env):
         self.step_forward = cfg["step_forward"]
         self.p_trans_mode = cfg["p_trans_mode"]
         self.p_trans_seed = int(cfg.get("p_trans_seed", 0))
+        self.jammer_reactive_beta = float(cfg.get("jammer_reactive_beta", 0.0))
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
         self.fairness_min_success_rate = float(cfg.get("fairness_min_success_rate", 0.0))
@@ -906,8 +904,10 @@ class Environ(gym.Env):
         return state
 
     def step(self, a):
-        action = deepcopy(a)
-        self.decomposition_action(action)
+        # NOTE: `a` comes from the caller (and in our training it is freshly created each step).
+        # `decomposition_action()` does not mutate the action container, so `deepcopy` is unnecessary
+        # and can become a major overhead when running many env steps in parallel workers.
+        self.decomposition_action(a)
         reward = self.act()
         state_next = self.get_state()  # 得到新的状态
         self.renew_jammer_channels_after_learn()
@@ -924,22 +924,19 @@ class Environ(gym.Env):
         return smooth_data
 
     def plot(self, cost_list):
+        import matplotlib.pyplot as plt
+
         y_data = self.smooth(cost_list, 19)
         x_data = np.arange(len(cost_list))
-        # sns.set(style="darkgrid", font_scale=1.5)
-        # sns.tsplot(time=x_data, data=y_data, color='b', linestyle='-')
         np.savetxt('DRQN_po.txt', y_data[0], fmt='%f')
         np.save('DRQN.npy',  y_data[0])
-
 
         plt.plot(x_data, y_data[0])
         plt.ylabel('DRQN__reward')
         plt.xlabel('training Episode')
-        # plt.ylim(0.5, 1.0)
         plt.show()
 
         plt.plot(x_data, cost_list)
         plt.ylabel('reward')
         plt.xlabel('training Episode')
-        # plt.ylim(0.5, 1.0)
         plt.show()
