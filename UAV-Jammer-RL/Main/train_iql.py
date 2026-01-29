@@ -193,6 +193,7 @@ def train_mpdqn_iql(
             jump_history=jump_history,
             n_episode=n_episode,
             n_steps=n_steps,
+            trainer=trainer,
         )
 
     return trainer.agents, {

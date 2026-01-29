@@ -23,8 +23,12 @@ def save_training_data(
     jump_history,
     n_episode: int,
     n_steps: int,
+    trainer: Optional[Any] = None,
 ) -> Tuple[str, str]:
-    """Save metrics to `Draw/experiment-data/{algorithm}_{timestamp}/` under repo root (json + npz + png)."""
+    """Save metrics to `Draw/experiment-data/{algorithm}_{timestamp}/` under repo root (json + npz + png).
+    
+    If trainer is provided, also saves the network weights (model parameters).
+    """
     repo_root = get_repo_root()
     base_dir = repo_root / "Draw" / "experiment-data"
 
@@ -75,7 +79,77 @@ def save_training_data(
     except Exception as e:
         print(f"Plot skipped: {e}")
 
+    # Save network weights if trainer is provided
+    if trainer is not None:
+        try:
+            weights_path = _save_model_weights(trainer, data_dir, algorithm)
+            print(f"  Weights: {weights_path}")
+        except Exception as e:
+            print(f"Model weights saving skipped: {e}")
+
     return str(json_path), str(npz_path)
+
+
+def _save_model_weights(trainer: Any, data_dir: Path, algorithm: str) -> str:
+    """Save network weights (model parameters) for the trainer.
+    
+    Supports both QMIX trainer (with mixer) and IQL trainer (agents only).
+    
+    Saved structure:
+    - agents: list of agent state dicts, each containing:
+        - actor: actor network weights
+        - q_net: Q-network weights
+        - target_actor: target actor network weights
+        - target_q_net: target Q-network weights
+    - mixer (QMIX only): mixer network weights
+    - target_mixer (QMIX only): target mixer network weights
+    - config: architecture configuration for reconstruction
+    """
+    import torch
+    
+    weights_path = data_dir / f"{algorithm}_weights.pth"
+    
+    checkpoint = {
+        "algorithm": algorithm,
+        "agents": [],
+    }
+    
+    # Get agents list - handle both trainer types
+    agents = getattr(trainer, "agents", None)
+    if agents is None:
+        # For IQL, trainer.agents is the list directly
+        raise ValueError("Trainer does not have 'agents' attribute")
+    
+    # Save each agent's network weights
+    for i, agent in enumerate(agents):
+        agent_state = {
+            "actor": agent.actor.state_dict(),
+            "q_net": agent.q_net.state_dict(),
+            "target_actor": agent.target_actor.state_dict(),
+            "target_q_net": agent.target_q_net.state_dict(),
+        }
+        checkpoint["agents"].append(agent_state)
+    
+    # Save agent architecture config (from first agent)
+    if agents:
+        first_agent = agents[0]
+        checkpoint["agent_config"] = {
+            "state_dim": first_agent.state_dim,
+            "n_actions": first_agent.n_actions,
+            "param_dim": first_agent.param_dim,
+        }
+    
+    # Save mixer if exists (QMIX trainer)
+    if hasattr(trainer, "mixer") and trainer.mixer is not None:
+        checkpoint["mixer"] = trainer.mixer.state_dict()
+        checkpoint["target_mixer"] = trainer.target_mixer.state_dict()
+        checkpoint["mixer_config"] = {
+            "n_agents": trainer.n_agents,
+            "global_state_dim": trainer.global_state_dim,
+        }
+    
+    torch.save(checkpoint, str(weights_path))
+    return str(weights_path)
 
 
 def _plot_metrics_png(reward: np.ndarray, success_rate: np.ndarray, algorithm: str, save_path: str) -> None:
