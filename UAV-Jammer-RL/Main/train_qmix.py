@@ -34,7 +34,7 @@ def train_mpdqn_qmix(
     # NOTE: delay torch imports so that SubprocVecEnv workers don't import torch/CUDA on spawn.
     import torch
 
-    from algorithms.mpdqn.qmix_trainer import MPDQNQMIXTrainer
+    from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):

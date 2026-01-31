@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from algorithms.mpdqn.agent import MPDQNAgent
-from algorithms.mpdqn.joint_replay_buffer_iql import MPDQNJointIQLReplayBuffer
+from algorithms.mpdqn.iql.joint_replay_buffer import MPDQNJointIQLReplayBuffer
 
 
 class MPDQNJointIQLTrainer:
@@ -147,4 +147,3 @@ class MPDQNJointIQLTrainer:
 
 
 __all__ = ["MPDQNJointIQLTrainer"]
-

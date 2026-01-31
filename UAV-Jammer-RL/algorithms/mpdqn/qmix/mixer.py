@@ -70,4 +70,3 @@ class QMIXMixer(nn.Module):
 
 
 __all__ = ["QMIXMixer"]
-

@@ -33,7 +33,7 @@ def train_mpdqn_iql(
     # NOTE: delay torch imports so that SubprocVecEnv workers don't import torch/CUDA on spawn.
     import torch
 
-    from algorithms.mpdqn.iql_joint_trainer import MPDQNJointIQLTrainer
+    from algorithms.mpdqn.iql.trainer import MPDQNJointIQLTrainer
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
