@@ -3,4 +3,6 @@
 Run as modules from `UAV-Jammer-RL/`:
 - `python -m Main.train_iql`
 - `python -m Main.train_qmix`
+- `python -m Main.train_qmix_value_expansion`
+- `python -m Main.train_world_model`
 """

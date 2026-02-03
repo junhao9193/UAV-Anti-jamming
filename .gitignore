@@ -9,3 +9,4 @@
 __pycache__/
 *.pyc
 prompt.txt
+/UAV-Jammer-RL/logs
