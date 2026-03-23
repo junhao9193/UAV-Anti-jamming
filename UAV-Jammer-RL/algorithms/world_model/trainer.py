@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -17,22 +16,22 @@ from algorithms.world_model.value_consistency import TDlambdaConfig, rollout_td_
 class WorldModelLosses:
     loss_state: float
     loss_reward: float
+    loss_kl: float
     loss_vc: float
     loss_total: float
 
 
 class ValueConsistentWorldModelTrainer:
     """
-    GRU world model trainer implementing:
+    RSSM world model trainer implementing:
 
-      L_WM = L_S + alpha * L_R + eta * L_VC
+      L_WM = L_S + alpha * L_R + kl_beta * L_KL + eta * L_VC
 
     where:
-      - L_S: MSE on Δs
+      - L_S: MSE on delta-s
       - L_R: MSE on team reward
+      - L_KL: posterior-prior KL for the RSSM latent state
       - L_VC: value-consistency regularizer (TD(lambda) rollout vs target Q_tot teacher)
-
-    Inputs are sequences (contiguous segments) built from (s,u,r,s',done,env_id) replay.
     """
 
     def __init__(
@@ -71,17 +70,10 @@ class ValueConsistentWorldModelTrainer:
         self.param_dim = int(param_dim)
         self.power_min_dbm = float(power_min_dbm) if power_min_dbm is not None else None
         self.power_max_dbm = float(power_max_dbm) if power_max_dbm is not None else None
+        self.kl_beta = float(self.wm.cfg.kl_beta)
+        self.free_nats = float(self.wm.cfg.free_nats)
 
     def _encode_actions_seq(self, action_discrete_seq: torch.Tensor, action_params_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Encode execution-time joint actions for a sequence.
-
-        Args:
-            action_discrete_seq: (B,L,N)
-            action_params_seq:   (B,L,N,AP)
-        Returns:
-            action_enc_seq:      (B,L,Du)
-        """
         if action_discrete_seq.ndim != 3:
             raise ValueError(f"action_discrete_seq must be (B,L,N), got {tuple(action_discrete_seq.shape)}")
         if action_params_seq.ndim != 4:
@@ -91,7 +83,6 @@ class ValueConsistentWorldModelTrainer:
         if int(n_agents) != int(self.n_agents):
             raise ValueError(f"Expected N={self.n_agents}, got {int(n_agents)}")
 
-        # Flatten time into batch for vectorized encoding: (B*L, N, ...)
         ad = action_discrete_seq.reshape(int(bsz * seq_len), int(n_agents))
         ap = action_params_seq.reshape(int(bsz * seq_len), int(n_agents), -1)
         u = encode_joint_action_exec(
@@ -109,9 +100,6 @@ class ValueConsistentWorldModelTrainer:
 
     @staticmethod
     def _assert_contiguous(state_seq: torch.Tensor, next_state_seq: torch.Tensor) -> None:
-        """
-        Ensure s_{t+1} == next_state at t and equals next state's state at t+1 (no off-by-one).
-        """
         if state_seq.ndim != 3 or next_state_seq.ndim != 3:
             return
         if int(state_seq.shape[1]) < 2:
@@ -126,20 +114,32 @@ class ValueConsistentWorldModelTrainer:
             f"max|diff|={float(diff.max().item()):.6g}, mean|diff|={float(diff.mean().item()):.6g}"
         )
 
+    def _kl_loss(
+        self,
+        prior_mean_seq: torch.Tensor,
+        prior_std_seq: torch.Tensor,
+        post_mean_seq: torch.Tensor,
+        post_std_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        post_var = post_std_seq.pow(2)
+        prior_var = prior_std_seq.pow(2)
+        kl = torch.log(prior_std_seq / post_std_seq) + (post_var + (post_mean_seq - prior_mean_seq).pow(2)) / (2.0 * prior_var) - 0.5
+        kl = kl.sum(dim=-1)
+        if self.free_nats > 0.0:
+            kl = torch.clamp(kl, min=self.free_nats)
+        return kl.mean()
+
     @torch.no_grad()
     def eval_losses(
         self,
         *,
-        state_seq: torch.Tensor,  # (B,L,Ds)
-        action_discrete_seq: torch.Tensor,  # (B,L,N)
-        action_params_seq: torch.Tensor,  # (B,L,N,AP)
-        reward_seq: torch.Tensor,  # (B,L,1)
-        next_state_seq: torch.Tensor,  # (B,L,Ds)
+        state_seq: torch.Tensor,
+        action_discrete_seq: torch.Tensor,
+        action_params_seq: torch.Tensor,
+        reward_seq: torch.Tensor,
+        next_state_seq: torch.Tensor,
         value_teacher: Optional[MPDQNQMIXValueTeacher] = None,
     ) -> Tuple[WorldModelLosses, dict]:
-        """
-        Evaluation-only losses (NO gradient).
-        """
         state_seq = state_seq.to(self.device).to(torch.float32)
         next_state_seq = next_state_seq.to(self.device).to(torch.float32)
         action_discrete_seq = action_discrete_seq.to(self.device).to(torch.long)
@@ -150,13 +150,16 @@ class ValueConsistentWorldModelTrainer:
 
         action_enc_seq = self._encode_actions_seq(action_discrete_seq, action_params_seq)
         delta_true = next_state_seq - state_seq
-        delta_pred, reward_pred, _, h_last = self.wm(state_seq, action_enc_seq)
+        obs = self.wm.observe(state_seq, action_enc_seq, sample=False)
+        delta_pred = obs.delta_seq
+        reward_pred = obs.reward_seq
 
         loss_state = F.mse_loss(delta_pred, delta_true)
         loss_reward = F.mse_loss(reward_pred, reward_seq)
+        loss_kl = self._kl_loss(obs.prior_mean_seq, obs.prior_std_seq, obs.post_mean_seq, obs.post_std_seq)
 
         loss_vc = torch.zeros((), dtype=torch.float32, device=self.device)
-        debug = {"uses_vc": False}
+        debug = {"uses_vc": False, "uses_kl": True}
 
         if value_teacher is not None and float(self.eta) > 0.0:
             debug["uses_vc"] = True
@@ -164,7 +167,7 @@ class ValueConsistentWorldModelTrainer:
             ad_t = action_discrete_seq[:, -1, :]
             ap_t = action_params_seq[:, -1, :, :]
 
-            q_teacher = value_teacher.q_tot_target(s_t, ad_t, ap_t)  # already frozen params
+            q_teacher = value_teacher.q_tot_target(s_t, ad_t, ap_t)
 
             def _policy_fn(s_flat: torch.Tensor):
                 with torch.no_grad():
@@ -199,10 +202,11 @@ class ValueConsistentWorldModelTrainer:
                 }
             )
 
-        loss_total = loss_state + self.alpha * loss_reward + self.eta * loss_vc
+        loss_total = loss_state + self.alpha * loss_reward + self.kl_beta * loss_kl + self.eta * loss_vc
         losses = WorldModelLosses(
             loss_state=float(loss_state.item()),
             loss_reward=float(loss_reward.item()),
+            loss_kl=float(loss_kl.item()),
             loss_vc=float(loss_vc.item()),
             loss_total=float(loss_total.item()),
         )
@@ -231,14 +235,17 @@ class ValueConsistentWorldModelTrainer:
 
         action_enc_seq = self._encode_actions_seq(action_discrete_seq, action_params_seq)
         delta_true = next_state_seq - state_seq
-        delta_pred, reward_pred, _, _ = self.wm(state_seq, action_enc_seq)
+        obs = self.wm.observe(state_seq, action_enc_seq, sample=True)
+        delta_pred = obs.delta_seq
+        reward_pred = obs.reward_seq
 
         loss_state = F.mse_loss(delta_pred, delta_true)
         loss_reward = F.mse_loss(reward_pred, reward_seq)
+        loss_kl = self._kl_loss(obs.prior_mean_seq, obs.prior_std_seq, obs.post_mean_seq, obs.post_std_seq)
         loss_vc = torch.zeros((), dtype=torch.float32, device=self.device)
 
-        debug = {}
-        loss_total = loss_state + self.alpha * loss_reward
+        debug = {"uses_kl": True}
+        loss_total = loss_state + self.alpha * loss_reward + self.kl_beta * loss_kl
 
         if value_teacher is not None and float(self.eta) > 0.0:
             s_t = state_seq[:, -1, :]
@@ -288,6 +295,7 @@ class ValueConsistentWorldModelTrainer:
         losses = WorldModelLosses(
             loss_state=float(loss_state.item()),
             loss_reward=float(loss_reward.item()),
+            loss_kl=float(loss_kl.item()),
             loss_vc=float(loss_vc.item()),
             loss_total=float(loss_total.item()),
         )
@@ -295,4 +303,3 @@ class ValueConsistentWorldModelTrainer:
 
 
 __all__ = ["ValueConsistentWorldModelTrainer", "WorldModelLosses", "MPDQNQMIXValueTeacher", "MPDQNQMIXDims"]
-

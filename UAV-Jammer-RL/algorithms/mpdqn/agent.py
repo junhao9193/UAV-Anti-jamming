@@ -254,6 +254,10 @@ class MPDQNAgent:
         if not torch.isfinite(loss_actor):
             for p in self.q_net.parameters():
                 p.requires_grad = True
+            # Q optimizer may already have stepped under AMP above. Finalize the
+            # scaler state so the next iteration can safely call unscale_ again.
+            if self.use_amp:
+                self.scaler.update()
             return {"loss_q": float(loss_q.item()), "loss_actor": float("nan"), "skipped": 1}
 
         if self.use_amp:

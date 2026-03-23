@@ -28,6 +28,7 @@ def train_mpdqn_iql(
     device: str | None = None,
     save_data: bool = True,
     start_method: str = "spawn",
+    seed: int = 0,
 ):
     """MP-DQN (IQL) 训练主函数（每个 agent 独立学习）。"""
     # NOTE: delay torch imports so that SubprocVecEnv workers don't import torch/CUDA on spawn.
@@ -45,18 +46,22 @@ def train_mpdqn_iql(
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    _configure_torch(device)
+    use_amp = bool(use_amp) and device.startswith("cuda")
+
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+
     env0 = Environ()
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(
         int(num_envs),
         p_trans=p_trans_fixed,
         start_method=str(start_method),
+        seed=int(seed),
     )
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    _configure_torch(device)
-    use_amp = bool(use_amp) and device.startswith("cuda")
 
     # Pipeline-optimized IQL: one joint replay buffer + one joint batch sampling.
     # Algorithm semantics remain IQL (each agent updates ONLY from its own (o,a,r,o')).
@@ -218,6 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP mixed precision")
     parser.add_argument("--no-save", action="store_true", help="Disable saving metrics")
     args = parser.parse_args()
@@ -240,5 +246,6 @@ if __name__ == "__main__":
         device=args.device,
         save_data=not bool(args.no_save),
         start_method=str(args.start_method),
+        seed=int(args.seed),
     )
     print("Training completed!")

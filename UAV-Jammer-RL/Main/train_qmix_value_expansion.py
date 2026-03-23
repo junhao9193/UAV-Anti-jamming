@@ -1,5 +1,5 @@
 """
-MP-DQN (QMIX) + Value Expansion with a Value-Consistent GRU World Model.
+MP-DQN (QMIX) + Value Expansion with a Value-Consistent RSSM World Model.
 
 Implements the alternating loop described in `doc/价值一致性世界模型.md`:
   Step 0: collect real data with QMIX behavior policy (epsilon-greedy)
@@ -88,6 +88,9 @@ def train_qmix_value_expansion(
     # World model config
     wm_hidden_dim: int = 256,
     wm_n_layers: int = 1,
+    wm_stochastic_dim: int = 32,
+    wm_kl_beta: float = 0.1,
+    wm_free_nats: float = 1.0,
     wm_lr: float = 1e-3,
     wm_batch_size: int = 512,
     wm_updates_per_learn: int = 2,
@@ -97,15 +100,16 @@ def train_qmix_value_expansion(
     rollout_k: int = 4,
     # Curriculum schedule
     critic_warmup_ep: int = 200,
-    model_warmup_ep: int = 300,
+    model_warmup_ep: int = 200,
     ramp_start_ep: int = 300,
     ramp_end_ep: int = 1000,
-    alpha_model_max: float = 0.3,
+    alpha_model_max: float = 0.01,
     eta_max: float = 0.2,
+    seed: int = 0,
 ) -> Tuple[object, dict]:
     import torch
 
-    from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
+    from algorithms.mpdqn.qmix.trainer_greedy_actor import MPDQNQMIXTrainer
     from algorithms.world_model import JointWorldModelConfig, MPDQNQMIXDims, MPDQNQMIXValueTeacher, TDlambdaConfig
     from algorithms.world_model.action_encoding import exec_action_dim
     from algorithms.world_model.replay_buffer import WorldModelSequenceReplayBuffer
@@ -130,12 +134,16 @@ def train_qmix_value_expansion(
         int(num_envs),
         p_trans=p_trans_fixed,
         start_method=str(start_method),
+        seed=int(seed),
     )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     _configure_torch(str(device))
     use_amp = bool(use_amp) and str(device).startswith("cuda")
+
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
 
     # --- QMIX trainer ---
     qmix = MPDQNQMIXTrainer(
@@ -172,6 +180,9 @@ def train_qmix_value_expansion(
         action_dim=int(action_dim_exec),
         hidden_dim=int(wm_hidden_dim),
         n_layers=int(wm_n_layers),
+        stochastic_dim=int(wm_stochastic_dim),
+        kl_beta=float(wm_kl_beta),
+        free_nats=float(wm_free_nats),
     )
     td_cfg_obj = TDlambdaConfig(gamma=float(gamma), lam=float(lam), rollout_k=int(rollout_k))
 
@@ -217,15 +228,15 @@ def train_qmix_value_expansion(
     alpha_history = []
     eta_history = []
 
-    pbar = trange(n_episode, desc="Training(QMIX+WMVE-GRU)", unit="ep", ascii=True)
+    pbar = trange(n_episode, desc="Training(QMIX+WMVE-RSSM)", unit="ep", ascii=True)
     try:
         for episode in pbar:
-            # Training phases:
+            # Training phases (3-phase curriculum):
             #  - [0, critic_warmup_ep): train QMIX with real TD only (alpha_model=0), do not train WM
-            #  - [critic_warmup_ep, ramp_start_ep): freeze QMIX params, train WM with supervised loss only (eta=0)
+            #  - [model_warmup_ep, ramp_start_ep): freeze QMIX params, train WM with supervised loss only (eta=0)
             #  - [ramp_start_ep, ...): alternate updating QMIX and WM; enable alpha/eta ramp
             train_qmix = int(episode) < int(critic_warmup_ep) or int(episode) >= int(ramp_start_ep)
-            train_wm = int(episode) >= int(critic_warmup_ep)
+            train_wm = int(episode) >= int(model_warmup_ep)
 
             alpha_model = (
                 0.0
@@ -392,8 +403,8 @@ def train_qmix_value_expansion(
     }
 
     if save_data:
-        save_training_data(
-            algorithm="mpdqn_qmix_wmve_gru",
+        _, _, out_dir = save_training_data(
+            algorithm="mpdqn_qmix_wmve_rssm",
             reward_history=reward_history,
             success_rate_history=success_rate_history,
             energy_history=energy_history,
@@ -403,33 +414,24 @@ def train_qmix_value_expansion(
             trainer=qmix,
         )
 
-        # Save world model checkpoint into the same experiment directory (most recent).
-        repo_root = get_repo_root()
-        base_dir = repo_root / "Draw" / "experiment-data"
-        dirs = sorted(
-            [p for p in base_dir.iterdir() if p.is_dir() and p.name.startswith("mpdqn_qmix_wmve_gru_")],
-            key=lambda p: p.name,
-            reverse=True,
+        # Save world model checkpoint into the same experiment directory.
+        _save_world_model_checkpoint(
+            out_dir=out_dir,
+            wm_trainer=wm_trainer,
+            wm_cfg=asdict(wm_cfg_obj),
+            td_cfg=asdict(td_cfg_obj),
+            metrics={
+                "wm_loss_total": [float(x) for x in wm_loss_total_history],
+                "alpha_model": [float(x) for x in alpha_history],
+                "eta": [float(x) for x in eta_history],
+            },
         )
-        if dirs:
-            out_dir = dirs[0]
-            _save_world_model_checkpoint(
-                out_dir=out_dir,
-                wm_trainer=wm_trainer,
-                wm_cfg=asdict(wm_cfg_obj),
-                td_cfg=asdict(td_cfg_obj),
-                metrics={
-                    "wm_loss_total": [float(x) for x in wm_loss_total_history],
-                    "alpha_model": [float(x) for x in alpha_history],
-                    "eta": [float(x) for x in eta_history],
-                },
-            )
 
     return qmix, metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train QMIX + GRU World Model Value Expansion")
+    parser = argparse.ArgumentParser(description="Train QMIX + RSSM World Model Value Expansion")
 
     parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument("--steps", type=int, default=1000)
@@ -451,6 +453,9 @@ if __name__ == "__main__":
     parser.add_argument("--wm-buffer-capacity", type=int, default=500_000)
     parser.add_argument("--wm-hidden-dim", type=int, default=256)
     parser.add_argument("--wm-n-layers", type=int, default=1)
+    parser.add_argument("--wm-stochastic-dim", type=int, default=32)
+    parser.add_argument("--wm-kl-beta", type=float, default=0.1)
+    parser.add_argument("--wm-free-nats", type=float, default=1.0)
     parser.add_argument("--wm-lr", type=float, default=1e-3)
     parser.add_argument("--wm-batch-size", type=int, default=512)
     parser.add_argument("--wm-updates-per-learn", type=int, default=2)
@@ -460,16 +465,17 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-k", type=int, default=4)
 
     parser.add_argument("--critic-warmup-ep", type=int, default=200)
-    parser.add_argument("--model-warmup-ep", type=int, default=300)
+    parser.add_argument("--model-warmup-ep", type=int, default=200)
     parser.add_argument("--ramp-start-ep", type=int, default=300)
     parser.add_argument("--ramp-end-ep", type=int, default=500)
-    parser.add_argument("--alpha-model-max", type=float, default=0.3)
+    parser.add_argument("--alpha-model-max", type=float, default=0.01)
     parser.add_argument("--eta-max", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
     print("=" * 60)
-    print("Starting QMIX + World Model Value Expansion Training (GRU)")
+    print("Starting QMIX + World Model Value Expansion Training (RSSM)")
     print("=" * 60)
 
     train_qmix_value_expansion(
@@ -492,6 +498,9 @@ if __name__ == "__main__":
         wm_buffer_capacity=int(args.wm_buffer_capacity),
         wm_hidden_dim=int(args.wm_hidden_dim),
         wm_n_layers=int(args.wm_n_layers),
+        wm_stochastic_dim=int(args.wm_stochastic_dim),
+        wm_kl_beta=float(args.wm_kl_beta),
+        wm_free_nats=float(args.wm_free_nats),
         wm_lr=float(args.wm_lr),
         wm_batch_size=int(args.wm_batch_size),
         wm_updates_per_learn=int(args.wm_updates_per_learn),
@@ -504,6 +513,8 @@ if __name__ == "__main__":
         ramp_end_ep=int(args.ramp_end_ep),
         alpha_model_max=float(args.alpha_model_max),
         eta_max=float(args.eta_max),
+        seed=int(args.seed),
     )
     print("Training completed!")
+
 

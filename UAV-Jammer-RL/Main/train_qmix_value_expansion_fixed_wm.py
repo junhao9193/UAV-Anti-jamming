@@ -1,5 +1,5 @@
 """
-Train MP-DQN (QMIX) with Value Expansion using a *frozen* pretrained GRU world model.
+Train MP-DQN (QMIX) with Value Expansion using a *frozen* pretrained RSSM world model.
 
 User request:
   - load existing world model weights
@@ -67,7 +67,7 @@ def _load_qmix_weights(trainer, weights_path: Path, *, device: str) -> None:
 
 def _load_world_model(weights_path: Path, *, device: str):
     """
-    Load a pretrained GRU world model.
+    Load a pretrained RSSM world model.
 
     Supports both checkpoint formats:
       - train_qmix_value_expansion.py: {"wm_cfg": ..., "td_cfg": ..., "wm_state_dict": ...}
@@ -100,6 +100,9 @@ def _load_world_model(weights_path: Path, *, device: str):
         action_dim=int(wm_cfg_raw["action_dim"]),
         hidden_dim=int(wm_cfg_raw.get("hidden_dim", 256)),
         n_layers=int(wm_cfg_raw.get("n_layers", 1)),
+        stochastic_dim=int(wm_cfg_raw.get("stochastic_dim", 32)),
+        kl_beta=float(wm_cfg_raw.get("kl_beta", 0.1)),
+        free_nats=float(wm_cfg_raw.get("free_nats", 1.0)),
     )
 
     wm = JointWorldModel(wm_cfg).to(device)
@@ -131,7 +134,7 @@ def train_qmix_value_expansion_fixed_wm(
     qmix_weights: str | None = None,
     world_model_weights: str | None = None,
     # Value Expansion
-    alpha_model: float = 0.3,
+    alpha_model: float = 0.01,
     gamma: float = 0.99,
     lam: float = 0.8,
     rollout_k: int = 4,
@@ -141,21 +144,25 @@ def train_qmix_value_expansion_fixed_wm(
     epsilon_start: float = 0.2,
     epsilon_min: float = 0.01,
     epsilon_decay: float = 0.995,
+    seed: int = 0,
 ) -> Tuple[object, dict]:
     # Delay torch import so env workers don't import torch/CUDA.
     import torch
 
-    from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
+    from algorithms.mpdqn.qmix.trainer_greedy_actor import MPDQNQMIXTrainer
     from algorithms.world_model import MPDQNQMIXDims, MPDQNQMIXValueTeacher, TDlambdaConfig
     from algorithms.world_model.replay_buffer import WorldModelSequenceReplayBuffer
-
-    env0 = Environ()
-    p_trans_fixed = make_fixed_p_trans(env0)
-    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method))
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = bool(use_amp) and str(device).startswith("cuda")
+
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+
+    env0 = Environ()
+    p_trans_fixed = make_fixed_p_trans(env0)
+    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method), seed=int(seed))
 
     # --- QMIX ---
     qmix = MPDQNQMIXTrainer(
@@ -343,7 +350,7 @@ def train_qmix_value_expansion_fixed_wm(
 
     if bool(save_data):
         algorithm = "mpdqn_qmix_ve_fixed_wm"
-        save_training_data(
+        _, _, out_dir = save_training_data(
             algorithm=algorithm,
             reward_history=reward_history,
             success_rate_history=success_rate_history,
@@ -358,16 +365,7 @@ def train_qmix_value_expansion_fixed_wm(
         try:
             import json
 
-            repo_root = get_repo_root()
-            base_dir = repo_root / "Draw" / "experiment-data"
-            out_dirs = sorted(
-                [p for p in base_dir.iterdir() if p.is_dir() and p.name.startswith(f"{algorithm}_")],
-                key=lambda p: p.name,
-                reverse=True,
-            )
-            if out_dirs:
-                out_dir = out_dirs[0]
-                (out_dir / "ve_fixed_wm_config.json").write_text(
+            (out_dir / "ve_fixed_wm_config.json").write_text(
                     json.dumps(
                         {
                             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -381,6 +379,9 @@ def train_qmix_value_expansion_fixed_wm(
                                 "action_dim": int(wm_cfg.action_dim),
                                 "hidden_dim": int(wm_cfg.hidden_dim),
                                 "n_layers": int(wm_cfg.n_layers),
+                                "stochastic_dim": int(wm_cfg.stochastic_dim),
+                                "kl_beta": float(wm_cfg.kl_beta),
+                                "free_nats": float(wm_cfg.free_nats),
                             },
                         },
                         indent=2,
@@ -404,7 +405,7 @@ if __name__ == "__main__":
         _find_latest_weights(repo_root=repo_root, prefix="mpdqn_qmix_", filename="mpdqn_qmix_weights.pth")
     )
     default_wm = str(local_wm) if local_wm.exists() else str(
-        _find_latest_weights(repo_root=repo_root, prefix="world_model_gru_", filename="world_model_weights.pth")
+        _find_latest_weights(repo_root=repo_root, prefix="world_model_rssm_", filename="world_model_weights.pth")
     )
 
     parser = argparse.ArgumentParser(description="Train QMIX with Value Expansion using a frozen pretrained world model")
@@ -429,7 +430,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-save", action="store_true")
 
     # Fixed per request (still exposed for convenience).
-    parser.add_argument("--alpha-model", type=float, default=0.3)
+    parser.add_argument("--alpha-model", type=float, default=0.01)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=0.8)
     parser.add_argument("--rollout-k", type=int, default=4)
@@ -439,6 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-start", type=float, default=0.2)
     parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--epsilon-decay", type=float, default=0.995)
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -469,5 +471,7 @@ if __name__ == "__main__":
         epsilon_start=float(args.epsilon_start),
         epsilon_min=float(args.epsilon_min),
         epsilon_decay=float(args.epsilon_decay),
+        seed=int(args.seed),
     )
+
 

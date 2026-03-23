@@ -1,5 +1,5 @@
 """
-Train the joint recurrent world model (GRU) from step transitions.
+Train the joint recurrent world model (RSSM) from step transitions.
 
 Replay stores only (s, u, r, s', done, env_id) per step, then samples contiguous
 sequences by `env_id` for RNN training and value-consistency regularization.
@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans
+from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, make_unique_output_dir
 from tqdm.auto import trange
 
 
@@ -82,9 +82,8 @@ def _save_world_model_artifacts(
     import torch
 
     base_dir = repo_root / "Draw" / "experiment-data"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = base_dir / f"{algorithm}_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = make_unique_output_dir(base_dir, algorithm)
+    timestamp = out_dir.name.removeprefix(f"{algorithm}_")
 
     (out_dir / "world_model_config.json").write_text(
         json.dumps({"config": config, "losses": losses}, indent=2, ensure_ascii=False),
@@ -111,11 +110,13 @@ def _save_world_model_artifacts(
         ax.plot(x, losses["loss_total"], label="loss_total")
         ax.plot(x, losses["loss_state"], label="loss_state")
         ax.plot(x, losses["loss_reward"], label="loss_reward")
+        if "loss_kl" in losses:
+            ax.plot(x, losses["loss_kl"], label="loss_kl")
         if any(v != 0.0 for v in losses["loss_vc"]):
             ax.plot(x, losses["loss_vc"], label="loss_vc")
         ax.set_xlabel("Episode")
         ax.set_ylabel("Loss")
-        ax.set_title("World Model Training Losses (GRU)")
+        ax.set_title("World Model Training Losses (RSSM)")
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.tight_layout()
@@ -139,6 +140,9 @@ def train_world_model(
     seq_len: int = 8,
     hidden_dim: int = 256,
     n_layers: int = 1,
+    stochastic_dim: int = 32,
+    kl_beta: float = 0.1,
+    free_nats: float = 1.0,
     lr: float = 1e-3,
     alpha: float = 1.0,
     eta: float = 0.2,
@@ -154,7 +158,7 @@ def train_world_model(
 ) -> Tuple[object, dict]:
     import torch
 
-    from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
+    from algorithms.mpdqn.qmix.trainer_greedy_actor import MPDQNQMIXTrainer
     from algorithms.world_model import JointWorldModelConfig, TDlambdaConfig, ValueConsistentWorldModelTrainer
     from algorithms.world_model.action_encoding import exec_action_dim
     from algorithms.world_model.qmix_adapters import MPDQNQMIXDims, MPDQNQMIXValueTeacher
@@ -179,6 +183,7 @@ def train_world_model(
         int(num_envs),
         p_trans=p_trans_fixed,
         start_method=str(start_method),
+        seed=int(seed),
     )
 
     if device is None:
@@ -206,6 +211,9 @@ def train_world_model(
         action_dim=int(action_dim_exec),
         hidden_dim=int(hidden_dim),
         n_layers=int(n_layers),
+        stochastic_dim=int(stochastic_dim),
+        kl_beta=float(kl_beta),
+        free_nats=float(free_nats),
     )
     td_cfg = TDlambdaConfig(gamma=float(gamma), lam=float(lam), rollout_k=int(rollout_k))
 
@@ -264,16 +272,17 @@ def train_world_model(
         value_teacher = MPDQNQMIXValueTeacher(qmix_trainer, dims)
 
     buffer = WorldModelSequenceReplayBuffer(n_envs=int(n_envs), capacity=int(buffer_capacity))
-    loss_hist = {"loss_state": [], "loss_reward": [], "loss_vc": [], "loss_total": []}
+    loss_hist = {"loss_state": [], "loss_reward": [], "loss_kl": [], "loss_vc": [], "loss_total": []}
 
     try:
-        pbar = trange(n_episode, desc="Training(World-Model-GRU)", unit="ep", ascii=True)
+        pbar = trange(n_episode, desc="Training(World-Model-RSSM)", unit="ep", ascii=True)
         for episode in pbar:
             states = vecenv.reset()  # (E,N,S)
             global_states = states.reshape(n_envs, -1).astype(np.float32)  # (E,Ds)
 
             loss_state_sum = 0.0
             loss_reward_sum = 0.0
+            loss_kl_sum = 0.0
             loss_vc_sum = 0.0
             loss_total_sum = 0.0
             loss_count = 0
@@ -309,6 +318,7 @@ def train_world_model(
                         )
                         loss_state_sum += float(losses.loss_state)
                         loss_reward_sum += float(losses.loss_reward)
+                        loss_kl_sum += float(losses.loss_kl)
                         loss_vc_sum += float(losses.loss_vc)
                         loss_total_sum += float(losses.loss_total)
                         loss_count += 1
@@ -336,6 +346,7 @@ def train_world_model(
             loss_count = max(1, int(loss_count))
             loss_hist["loss_state"].append(loss_state_sum / loss_count)
             loss_hist["loss_reward"].append(loss_reward_sum / loss_count)
+            loss_hist["loss_kl"].append(loss_kl_sum / loss_count)
             loss_hist["loss_vc"].append(loss_vc_sum / loss_count)
             loss_hist["loss_total"].append(loss_total_sum / loss_count)
 
@@ -362,6 +373,9 @@ def train_world_model(
         "seq_len": int(seq_len),
         "seed": int(seed),
         "qmix_weights": str(qmix_weights_path),
+        "stochastic_dim": int(stochastic_dim),
+        "kl_beta": float(kl_beta),
+        "free_nats": float(free_nats),
         "epsilon": float(epsilon),
         "start_method": str(start_method),
         "wm_cfg": asdict(wm_cfg),
@@ -385,7 +399,7 @@ def train_world_model(
 
     if save:
         out_dir = _save_world_model_artifacts(
-            algorithm="world_model_gru",
+            algorithm="world_model_rssm",
             repo_root=repo_root,
             losses=loss_hist,
             config=config,
@@ -397,7 +411,7 @@ def train_world_model(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Joint World Model (GRU)")
+    parser = argparse.ArgumentParser(description="Train Joint World Model (RSSM)")
     parser.add_argument("--episodes", type=int, default=1500)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--num-envs", type=int, default=32)
@@ -405,10 +419,13 @@ if __name__ == "__main__":
     parser.add_argument("--buffer-capacity", type=int, default=500_000)
     parser.add_argument("--learn-every", type=int, default=4)
     parser.add_argument("--updates-per-learn", type=int, default=2)
-    parser.add_argument("--seq-len", type=int, default=8, help="Sequence length sampled for GRU training")
+    parser.add_argument("--seq-len", type=int, default=8, help="Sequence length sampled for recurrent world model training")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument('--stochastic-dim', type=int, default=32)
+    parser.add_argument('--kl-beta', type=float, default=0.1)
+    parser.add_argument('--free-nats', type=float, default=1.0)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -438,6 +455,9 @@ if __name__ == "__main__":
         seq_len=int(args.seq_len),
         hidden_dim=int(args.hidden_dim),
         n_layers=int(args.n_layers),
+        stochastic_dim=int(args.stochastic_dim),
+        kl_beta=float(args.kl_beta),
+        free_nats=float(args.free_nats),
         lr=float(args.lr),
         alpha=float(args.alpha),
         eta=float(args.eta),
@@ -451,3 +471,7 @@ if __name__ == "__main__":
         start_method=str(args.start_method),
         save=(not bool(args.no_save)),
     )
+
+
+
+

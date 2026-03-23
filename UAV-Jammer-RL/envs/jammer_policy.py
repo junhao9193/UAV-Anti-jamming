@@ -18,12 +18,57 @@ def _at_dwell_boundary(t: float, dwell: float) -> bool:
     return (remainder < _TIME_EPS) or (abs(remainder - float(dwell)) < _TIME_EPS)
 
 
+def _jammer_choices(env: Any, population, weights=None, k: int = 1):
+    rng = getattr(env, "_jammer_state_rng", None)
+    if rng is None:
+        return random.choices(population, weights=weights, k=k)
+    return rng.choices(population, weights=weights, k=k)
+
+
+def _maybe_switch_jammer_mode(env: Any) -> None:
+    m = int(getattr(env, "jammer_modes", 1))
+    if m <= 1:
+        env.jammer_mode = 0
+        return
+
+    p_switch = float(getattr(env, "jammer_mode_switch_prob", 0.0))
+    if p_switch <= 0.0:
+        env.jammer_mode = int(getattr(env, "jammer_mode", 0)) % m
+        return
+
+    rng = getattr(env, "_jammer_mode_rng", None)
+    if rng is None:
+        rng = np.random.default_rng()
+
+    curr = int(getattr(env, "jammer_mode", 0)) % m
+    if float(rng.random()) >= p_switch:
+        env.jammer_mode = curr
+        return
+
+    if m == 2:
+        env.jammer_mode = 1 - curr
+        return
+
+    # Sample a new mode uniformly from {0..m-1} \ {curr}
+    j = int(rng.integers(m - 1))
+    env.jammer_mode = j if j < curr else j + 1
+
+
+def _get_mode_transition_row(env: Any, idx: int) -> np.ndarray:
+    p_modes = getattr(env, "p_trans_modes", None)
+    if p_modes is None:
+        return np.asarray(env.p_trans[idx], dtype=np.float64)
+
+    mode = int(getattr(env, "jammer_mode", 0)) % int(p_modes.shape[0])
+    return np.asarray(p_modes[mode][idx], dtype=np.float64)
+
+
 def init_jammer_state(env: Any) -> None:
     if env.type_of_interference == "saopin":
         # self.jammer_channels = random.sample(range(0, self.n_channel), k=self.n_jammer)  #不包括 stop
-        env.jammer_channels = random.choices(range(env.n_channel), k=env.n_jammer)
+        env.jammer_channels = _jammer_choices(env, range(env.n_channel), k=env.n_jammer)
     elif env.type_of_interference == "markov":
-        env.jammer_channels = random.choices(env.all_jammer_states_list, k=1)[0]
+        env.jammer_channels = _jammer_choices(env, env.all_jammer_states_list, k=1)[0]
     else:
         raise ValueError(f"Unknown type_of_interference: {env.type_of_interference!r}")
 
@@ -69,7 +114,8 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
             old_jammer_channels = env.jammer_channels
             env.jammer_channels = tuple(env.jammer_channels)
             idx = env.all_jammer_states_list.index(env.jammer_channels)
-            p = np.asarray(env.p_trans[idx], dtype=np.float64)
+            _maybe_switch_jammer_mode(env)
+            p = _get_mode_transition_row(env, idx)
             beta = float(getattr(env, "jammer_reactive_beta", 0.0))
             if beta > 0.0:
                 used_set = set(int(x) for x in np.asarray(env.uav_channels, dtype=np.int32).reshape(-1).tolist())
@@ -83,7 +129,7 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
                     if np.isfinite(w_sum) and w_sum > 0.0:
                         p = w / w_sum
 
-            env.jammer_channels = random.choices(env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
+            env.jammer_channels = _jammer_choices(env, env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
 
             if _at_dwell_boundary(env.t_jammer, env.t_dwell):  # 传输完成后切换干扰信道
                 for i in range(env.n_jammer):
@@ -123,7 +169,8 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
 
         elif env.type_of_interference == "markov":
             idx = env.all_jammer_states_list.index(env.jammer_channels)
-            p = np.asarray(env.p_trans[idx], dtype=np.float64)
+            _maybe_switch_jammer_mode(env)
+            p = _get_mode_transition_row(env, idx)
             beta = float(getattr(env, "jammer_reactive_beta", 0.0))
             if beta > 0.0:
                 used_set = set(int(x) for x in np.asarray(env.uav_channels, dtype=np.int32).reshape(-1).tolist())
@@ -137,7 +184,7 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
                     if np.isfinite(w_sum) and w_sum > 0.0:
                         p = w / w_sum
 
-            env.jammer_channels = random.choices(env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
+            env.jammer_channels = _jammer_choices(env, env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
 
             # if self.t_jammer % self.t_dwell == 0:  传输开始前切换干扰信道
             for i in range(env.n_jammer):
@@ -148,27 +195,29 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
         # print("change_channels", self.jammer_channels)
 
 
-def generate_p_trans(jammer_state_dim: int, mode: int = 1) -> np.ndarray:
+def generate_p_trans(jammer_state_dim: int, mode: int = 1, rng: np.random.Generator | None = None) -> np.ndarray:
     # 不使用uniform, 因为从统计上感觉很好学, 差异性不大
-    p_trans = np.random.uniform(0, 1, [jammer_state_dim, jammer_state_dim])  # 从[0,1)均匀分布随机取数
+    if rng is None:
+        rng = np.random.default_rng()
+    p_trans = rng.uniform(0, 1, [jammer_state_dim, jammer_state_dim])  # 从[0,1)均匀分布随机取数
     p_trans_sum = np.sum(p_trans, axis=1)  # 每一行的数相加得到列向量
     if mode == 1:
         for i in range(jammer_state_dim):
-            temp = np.random.randint(low=0, high=jammer_state_dim)
+            temp = rng.integers(low=0, high=jammer_state_dim)
             p_trans[i][temp] += p_trans_sum[i] / 2
-            while np.random.random() > 0.5:
-                temp = np.random.randint(low=0, high=jammer_state_dim)
+            while rng.random() > 0.5:
+                temp = rng.integers(low=0, high=jammer_state_dim)
                 p_trans[i][temp] += p_trans_sum[i] / 3
     elif mode == 2:
         for i in range(jammer_state_dim):
-            while np.random.random() > 0.7:
-                temp = np.random.randint(low=0, high=jammer_state_dim)
+            while rng.random() > 0.7:
+                temp = rng.integers(low=0, high=jammer_state_dim)
                 p_trans[i][temp] += p_trans_sum[i] / 2
     elif mode == 3:
         pass
     elif mode == 4:
         for i in range(jammer_state_dim):
-            temp = np.random.randint(low=0, high=jammer_state_dim)
+            temp = rng.integers(low=0, high=jammer_state_dim)
             p_trans[i][temp] += p_trans_sum[i]
 
     p_trans_sum = np.sum(p_trans, axis=1)

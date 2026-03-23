@@ -30,6 +30,13 @@ class Environ(gym.Env):
     def __init__(self, config=None, config_path=None):
         cfg = load_env_config(config=config, config_path=config_path)
 
+        def _resolve_local_seed(explicit_seed):
+            if explicit_seed is not None:
+                return int(explicit_seed)
+            # Derive child RNG seeds from the current global numpy RNG state so
+            # worker-side `np.random.seed(...)` propagates into private RNG streams.
+            return int(np.random.randint(0, 2**31 - 1))
+
         self.length = cfg["length"]  # 1000
         self.width = cfg["width"]  # 500
         self.low_height = cfg["low_height"]
@@ -131,6 +138,44 @@ class Environ(gym.Env):
                 size=(int(self.n_jammer), int(self.n_uav), int(self.n_channel)),
             ).astype(np.float32)
 
+        # Fast fading (small-scale), temporally correlated Rayleigh (AR(1) on complex coefficients).
+        # We model per-link, per-channel complex fading h_t:
+        #   h_t = rho * h_{t-1} + sqrt(1-rho^2) * w_t,   w_t ~ CN(0,1)
+        # The power-gain in dB is 20*log10(|h_t|). Effective loss (dB) becomes:
+        #   loss_db = base_loss_db - fast_fading_db
+        # so received power: P_rx_dbm = P_tx_dbm - loss_db + gains - NF.
+        self.enable_fast_fading = bool(cfg.get("enable_fast_fading", True))
+        self.fast_fading_rho = float(cfg.get("fast_fading_rho", 0.95))
+        if not (0.0 <= self.fast_fading_rho < 1.0):
+            raise ValueError(f"fast_fading_rho must be in [0,1), got {self.fast_fading_rho}")
+        self.fast_fading_eps = float(cfg.get("fast_fading_eps", 1e-12))
+        self.fast_fading_db_clip_low = cfg.get("fast_fading_db_clip_low", None)
+        self.fast_fading_db_clip_high = cfg.get("fast_fading_db_clip_high", None)
+        if self.fast_fading_db_clip_low is not None:
+            self.fast_fading_db_clip_low = float(self.fast_fading_db_clip_low)
+        if self.fast_fading_db_clip_high is not None:
+            self.fast_fading_db_clip_high = float(self.fast_fading_db_clip_high)
+        if (self.fast_fading_db_clip_low is None) != (self.fast_fading_db_clip_high is None):
+            raise ValueError("fast_fading_db_clip_low/high must both be set or both be null")
+        if (
+            self.fast_fading_db_clip_low is not None
+            and self.fast_fading_db_clip_high is not None
+            and not (self.fast_fading_db_clip_low < self.fast_fading_db_clip_high)
+        ):
+            raise ValueError(
+                "fast_fading_db_clip_low must be < fast_fading_db_clip_high, got "
+                f"{self.fast_fading_db_clip_low} vs {self.fast_fading_db_clip_high}"
+            )
+        fast_fading_seed = _resolve_local_seed(cfg.get("fast_fading_seed", None))
+        self._fast_fading_rng = np.random.default_rng(int(fast_fading_seed))
+        # E[20*log10(|h|)] for Rayleigh (CN(0,1)/sqrt(2)) is approx -2.507 dB.
+        # Subtract this mean so that fast fading fluctuates around 0 dB.
+        # Derivation: E[ln|h|] = -gamma/2 for Rayleigh(sigma=1/sqrt(2)),
+        # so E[20*log10|h|] = (20/ln10)*(-gamma/2) = -10*gamma/ln10.
+        self._rayleigh_mean_db = float(-10.0 * np.euler_gamma / np.log(10.0))
+        self._uav_fast_h = None  # complex64, (n_uav,n_uav,n_channel)
+        self._jammer_fast_h = None  # complex64, (n_jammer,n_uav,n_channel)
+
         self.max_distance1 = cfg["max_distance1"]
         self.max_distance2 = cfg["max_distance2"]
 
@@ -140,6 +185,22 @@ class Environ(gym.Env):
         self.p_trans_mode = cfg["p_trans_mode"]
         self.p_trans_seed = int(cfg.get("p_trans_seed", 0))
         self.jammer_reactive_beta = float(cfg.get("jammer_reactive_beta", 0.0))
+        # Hidden jammer mode (Dec-POMDP): jammer uses one of M Markov transition matrices and switches modes slowly.
+        self.jammer_modes = int(cfg.get("jammer_modes", 1))
+        if int(self.jammer_modes) <= 0:
+            raise ValueError(f"jammer_modes must be positive, got {self.jammer_modes}")
+        self.jammer_mode_switch_prob = float(cfg.get("jammer_mode_switch_prob", 0.0))
+        if not (0.0 <= float(self.jammer_mode_switch_prob) <= 1.0):
+            raise ValueError(
+                f"jammer_mode_switch_prob must be in [0,1], got {self.jammer_mode_switch_prob}"
+            )
+        jammer_mode_seed = _resolve_local_seed(cfg.get("jammer_mode_seed", None))
+        self._jammer_mode_rng = np.random.default_rng(int(jammer_mode_seed))
+        # Jammer state sampling uses its own RNG as well so hidden-mode transitions
+        # remain reproducible without depending on the process-global `random` state.
+        self._jammer_state_rng = random.Random(int(jammer_mode_seed))
+        self.jammer_mode = 0
+        self.p_trans_modes = None
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
         self.fairness_min_success_rate = float(cfg.get("fairness_min_success_rate", 0.0))
@@ -197,6 +258,36 @@ class Environ(gym.Env):
         self.reset(self.generate_p_trans(mode=self.p_trans_mode))
         self.state_dim = len(self.get_state()[0])
         self.observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(self.state_dim,)) for _ in range(self.n_ch)]
+
+    def _sample_complex_gaussian(self, shape):
+        real = self._fast_fading_rng.normal(0.0, 1.0, size=shape).astype(np.float32)
+        imag = self._fast_fading_rng.normal(0.0, 1.0, size=shape).astype(np.float32)
+        return ((real + 1j * imag) / np.sqrt(2.0)).astype(np.complex64)
+
+    def _init_fast_fading(self) -> None:
+        if not self.enable_fast_fading:
+            self._uav_fast_h = None
+            self._jammer_fast_h = None
+            return
+        self._uav_fast_h = self._sample_complex_gaussian((int(self.n_uav), int(self.n_uav), int(self.n_channel)))
+        self._jammer_fast_h = self._sample_complex_gaussian(
+            (int(self.n_jammer), int(self.n_uav), int(self.n_channel))
+        )
+
+    def _update_fast_fading(self) -> None:
+        if not self.enable_fast_fading:
+            return
+        if self._uav_fast_h is None or self._jammer_fast_h is None:
+            self._init_fast_fading()
+            return
+        rho = float(self.fast_fading_rho)
+        sigma = float(np.sqrt(max(0.0, 1.0 - rho * rho)))
+        self._uav_fast_h = (rho * self._uav_fast_h + sigma * self._sample_complex_gaussian(self._uav_fast_h.shape)).astype(
+            np.complex64
+        )
+        self._jammer_fast_h = (
+            rho * self._jammer_fast_h + sigma * self._sample_complex_gaussian(self._jammer_fast_h.shape)
+        ).astype(np.complex64)
 
     def all_observed_states(self):
         self.observed_state_list = []
@@ -332,6 +423,10 @@ class Environ(gym.Env):
             for j in range(self.n_des):
                 self.uav_channels[i][j] = random.randint(0, self.n_channel - 1)  #包括上下限
                 self.uav_powers[i][j] = random.uniform(self.uav_power_min, self.uav_power_max)  # dBm
+        if int(self.jammer_modes) > 1:
+            self.jammer_mode = int(self._jammer_mode_rng.integers(int(self.jammer_modes)))
+        else:
+            self.jammer_mode = 0
         init_jammer_state(self)
 
         # print("jammer_channels", self.jammer_channels)
@@ -345,6 +440,10 @@ class Environ(gym.Env):
 
         self.UAVchannels = UAVchannels(self.n_uav, self.n_channel, self.BS_position)
         self.Jammerchannels = Jammerchannels(self.n_jammer, self.n_uav, self.n_channel, self.BS_position)
+        # Reset fast fading between episodes. The first `renew_channels()` will init h_0
+        # (without applying an AR update), so reset state aligns with h_0 rather than h_1.
+        self._uav_fast_h = None
+        self._jammer_fast_h = None
         self.renew_channels()
 
     def get_state(self):
@@ -376,7 +475,7 @@ class Environ(gym.Env):
 
         else:
             joint_state = []
-            # CSI：每条链路在每个信道上的大尺度 CSI（路径损耗 + 信道固定差异/选择性），不引入快衰落。
+            # CSI：每条链路在每个信道上的 CSI（路径损耗 + 信道固定差异/选择性 + 可选快衰落）。
             # 形状: (n_ch, n_des, n_channel)
             csi = np.zeros([self.n_ch, self.n_des, self.n_channel], dtype=np.float32)
 
@@ -839,18 +938,33 @@ class Environ(gym.Env):
         self.UAVchannels.update_positions(uav_positions)
         self.Jammerchannels.update_pathloss()
         self.UAVchannels.update_pathloss()
+        self._update_fast_fading()
         uav_channels_loss_db = np.repeat(self.UAVchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
         uav_channels_loss_db = (
             uav_channels_loss_db + self.channel_loss_db.reshape(1, 1, -1) + self.uav_channel_selectivity_db
         )
-        self.UAVchannels_loss_db = uav_channels_loss_db
+        if self.enable_fast_fading and self._uav_fast_h is not None:
+            uav_fast_db = 20.0 * np.log10(np.abs(self._uav_fast_h) + float(self.fast_fading_eps)) - self._rayleigh_mean_db
+            if self.fast_fading_db_clip_low is not None and self.fast_fading_db_clip_high is not None:
+                uav_fast_db = np.clip(uav_fast_db, self.fast_fading_db_clip_low, self.fast_fading_db_clip_high)
+            self.UAVchannels_loss_db = uav_channels_loss_db - uav_fast_db.astype(np.float32)
+        else:
+            self.UAVchannels_loss_db = uav_channels_loss_db
         jammer_channels_loss_db = np.repeat(self.Jammerchannels.PathLoss[:, :, np.newaxis], self.n_channel, axis=2)
         jammer_channels_loss_db = (
             jammer_channels_loss_db
             + self.channel_loss_db.reshape(1, 1, -1)
             + self.jammer_channel_selectivity_db
         )
-        self.Jammerchannels_loss_db = jammer_channels_loss_db
+        if self.enable_fast_fading and self._jammer_fast_h is not None:
+            jammer_fast_db = 20.0 * np.log10(np.abs(self._jammer_fast_h) + float(self.fast_fading_eps)) - self._rayleigh_mean_db
+            if self.fast_fading_db_clip_low is not None and self.fast_fading_db_clip_high is not None:
+                jammer_fast_db = np.clip(
+                    jammer_fast_db, self.fast_fading_db_clip_low, self.fast_fading_db_clip_high
+                )
+            self.Jammerchannels_loss_db = jammer_channels_loss_db - jammer_fast_db.astype(np.float32)
+        else:
+            self.Jammerchannels_loss_db = jammer_channels_loss_db
 
     def act(self):
         self.renew_jammer_channels_after_Rx()
@@ -891,11 +1005,38 @@ class Environ(gym.Env):
                     self.uav_jump_count[i] += 1
                 decoded = int(decoded / self.n_channel)
 
-    def generate_p_trans(self, mode = 1):
-        return generate_jammer_p_trans(self.jammer_state_dim, mode=mode)
+    def generate_p_trans(self, mode = 1, rng=None):
+        return generate_jammer_p_trans(self.jammer_state_dim, mode=mode, rng=rng)
 
     def set_p(self, p_trans):
-        self.p_trans = p_trans
+        p_arr = np.asarray(p_trans, dtype=np.float32)
+        if p_arr.ndim == 2:
+            self.p_trans = p_arr
+            if int(self.jammer_modes) <= 1:
+                self.p_trans_modes = None
+            else:
+                # Build per-mode transition matrices. Use the provided p_trans as mode 0,
+                # and generate the remaining matrices deterministically from `p_trans_seed`.
+                m = int(self.jammer_modes)
+                p_modes = np.zeros((m, int(self.jammer_state_dim), int(self.jammer_state_dim)), dtype=np.float32)
+                p_modes[0] = p_arr
+                for mode_idx in range(1, m):
+                    mode_rng = np.random.default_rng(int(self.p_trans_seed) + 10007 * mode_idx + 12345)
+                    p_modes[mode_idx] = np.asarray(
+                        generate_jammer_p_trans(self.jammer_state_dim, mode=int(self.p_trans_mode), rng=mode_rng),
+                        dtype=np.float32,
+                    )
+                self.p_trans_modes = p_modes
+        elif p_arr.ndim == 3:
+            if p_arr.shape[1] != int(self.jammer_state_dim) or p_arr.shape[2] != int(self.jammer_state_dim):
+                raise ValueError(
+                    "Invalid p_trans shape. Expected (M, D, D) with D=jammer_state_dim, got "
+                    f"{p_arr.shape} (D={self.jammer_state_dim})"
+                )
+            self.p_trans_modes = p_arr
+            self.p_trans = p_arr[0]
+        else:
+            raise ValueError(f"Invalid p_trans ndim={p_arr.ndim}. Expected 2 or 3 dims.")
 
     def reset(self, p_trans):
         self.set_p(p_trans)

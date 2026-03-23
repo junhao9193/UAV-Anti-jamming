@@ -41,6 +41,14 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     # Link-level frequency selectivity (static across an entire run when seed is fixed).
     "channel_selectivity_std_db": 2.0,
     "channel_selectivity_seed": 0,
+    # Fast fading (small-scale): temporally correlated Rayleigh via AR(1) on complex coefficients.
+    # If `fast_fading_seed` is None, a private seed is derived from the worker/global RNG state.
+    "enable_fast_fading": True,
+    "fast_fading_rho": 0.95,
+    "fast_fading_seed": None,
+    "fast_fading_eps": 1.0e-12,
+    "fast_fading_db_clip_low": -30.0,
+    "fast_fading_db_clip_high": 10.0,
     # Spectrum sensing energy map weights and noise.
     "sensing_w_jammer": 1.0,
     "sensing_w_uav": 0.8,
@@ -58,6 +66,11 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "p_trans_seed": 0,
     # Reactive bias (only for markov): >0 makes jammer prefer next-states overlapping with UAV used channels.
     "jammer_reactive_beta": 1.0,
+    # Hidden jammer mode (Dec-POMDP): jammer uses one of M Markov transition matrices and switches modes slowly.
+    # If `jammer_mode_seed` is None, a private seed is derived from the worker/global RNG state.
+    "jammer_modes": 3,
+    "jammer_mode_switch_prob": 0.02,
+    "jammer_mode_seed": None,
     "reward_energy_weight": 1.0,
     "reward_jump_weight": 0.1,
     # Fairness (team penalty): if any cluster's success rate < threshold, penalize the whole team.

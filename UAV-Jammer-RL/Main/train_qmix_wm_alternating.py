@@ -1,7 +1,11 @@
 """
-Alternating training loop: QMIX (with Value Expansion) <-> Value-Consistent GRU World Model.
+Alternating training loop: QMIX (with Value Expansion) <-> Value-Consistent RSSM World Model.
 
-User-specified schedule:
+Supports two modes:
+  - From scratch (default): initialize QMIX + RSSM randomly, then alternate training blocks
+  - Resume/fine-tune: load QMIX and/or RSSM checkpoints if explicit paths are provided
+
+Default schedule:
   - Freeze world model, update QMIX with mixed TD target for 50 episodes
   - Freeze QMIX, use it as behavior policy + value teacher, update world model for 50 episodes
   - Repeat, total episodes = 500
@@ -10,6 +14,7 @@ This is a "block coordinate descent" style alternating optimization, different f
 alpha/eta ramp schedule used in `train_qmix_value_expansion.py`.
 
 Run from `UAV-Jammer-RL/`:
+  python -m Main.train_qmix_wm_alternating
   python -m Main.train_qmix_wm_alternating --qmix-weights <...> --world-model-weights <...>
 """
 
@@ -87,8 +92,8 @@ def _load_world_model_weights(wm_trainer, weights_path: Path, *, device: str, ck
 
 def train_qmix_wm_alternating(
     *,
-    qmix_weights: str,
-    world_model_weights: str,
+    qmix_weights: str | None = None,
+    world_model_weights: str | None = None,
     total_episodes: int = 500,
     qmix_block_episodes: int = 50,
     wm_block_episodes: int = 50,
@@ -107,12 +112,17 @@ def train_qmix_wm_alternating(
     device: str | None = None,
     start_method: str = "spawn",
     # Value Expansion
-    alpha_model: float = 0.3,
+    alpha_model: float = 0.01,
     gamma: float = 0.99,
     lam: float = 0.8,
     rollout_k: int = 4,
     seq_len: int = 8,
     wm_buffer_capacity: int = 500_000,
+    wm_hidden_dim: int = 256,
+    wm_n_layers: int = 1,
+    wm_stochastic_dim: int = 32,
+    wm_kl_beta: float = 0.1,
+    wm_free_nats: float = 1.0,
     # World model training
     wm_lr: float = 1e-3,
     wm_batch_size: int = 512,
@@ -124,11 +134,12 @@ def train_qmix_wm_alternating(
     epsilon_min: float = 0.01,
     epsilon_decay: float = 0.995,
     save_data: bool = True,
+    seed: int = 0,
 ) -> None:
     import json
     import torch
 
-    from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
+    from algorithms.mpdqn.qmix.trainer_greedy_actor import MPDQNQMIXTrainer
     from algorithms.world_model import JointWorldModelConfig, MPDQNQMIXDims, MPDQNQMIXValueTeacher, TDlambdaConfig
     from algorithms.world_model.action_encoding import exec_action_dim
     from algorithms.world_model.replay_buffer import WorldModelSequenceReplayBuffer
@@ -138,9 +149,12 @@ def train_qmix_wm_alternating(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = bool(use_amp) and str(device).startswith("cuda")
 
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+
     env0 = Environ()
     p_trans_fixed = make_fixed_p_trans(env0)
-    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method))
+    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method), seed=int(seed))
 
     # --- QMIX ---
     qmix = MPDQNQMIXTrainer(
@@ -159,7 +173,8 @@ def train_qmix_wm_alternating(
         max_grad_norm=float(max_grad_norm),
         device=str(device),
     )
-    _load_qmix_weights(qmix, Path(qmix_weights), device=str(device))
+    if qmix_weights is not None:
+        _load_qmix_weights(qmix, Path(qmix_weights), device=str(device))
     for agent in qmix.agents:
         agent.actor.train()
         agent.q_net.train()
@@ -176,35 +191,50 @@ def train_qmix_wm_alternating(
         param_dim=int(env0.param_dim_per_action),
     )
 
-    wm_ckpt_raw = torch.load(str(world_model_weights), map_location=str(device))
+    wm_ckpt_raw: dict = {}
+    if world_model_weights is not None:
+        wm_ckpt_raw = torch.load(str(world_model_weights), map_location=str(device))
 
-    # Support both checkpoint formats:
-    # - train_qmix_value_expansion.py: {"wm_cfg": ..., "wm_state_dict": ...}
-    # - train_world_model.py: {"config": {"wm_cfg": ...}, "wm_state_dict": ...}
-    wm_cfg_raw = None
-    if isinstance(wm_ckpt_raw.get("wm_cfg", None), dict):
-        wm_cfg_raw = wm_ckpt_raw["wm_cfg"]
-    elif isinstance(wm_ckpt_raw.get("config", None), dict) and isinstance(wm_ckpt_raw["config"].get("wm_cfg", None), dict):
-        wm_cfg_raw = wm_ckpt_raw["config"]["wm_cfg"]
-    if not isinstance(wm_cfg_raw, dict):
-        raise ValueError(
-            "Invalid world model checkpoint (missing 'wm_cfg' or 'config.wm_cfg'): "
-            f"{world_model_weights}"
+        # Support both checkpoint formats:
+        # - train_qmix_value_expansion.py: {"wm_cfg": ..., "wm_state_dict": ...}
+        # - train_world_model.py: {"config": {"wm_cfg": ...}, "wm_state_dict": ...}
+        wm_cfg_raw = None
+        if isinstance(wm_ckpt_raw.get("wm_cfg", None), dict):
+            wm_cfg_raw = wm_ckpt_raw["wm_cfg"]
+        elif isinstance(wm_ckpt_raw.get("config", None), dict) and isinstance(wm_ckpt_raw["config"].get("wm_cfg", None), dict):
+            wm_cfg_raw = wm_ckpt_raw["config"]["wm_cfg"]
+        if not isinstance(wm_cfg_raw, dict):
+            raise ValueError(
+                "Invalid world model checkpoint (missing 'wm_cfg' or 'config.wm_cfg'): "
+                f"{world_model_weights}"
+            )
+        if int(wm_cfg_raw.get("state_dim", -1)) != int(global_state_dim):
+            raise ValueError(
+                f"WM state_dim mismatch: ckpt={wm_cfg_raw.get('state_dim')} vs env={global_state_dim}"
+            )
+        if int(wm_cfg_raw.get("action_dim", -1)) != int(action_exec_dim):
+            raise ValueError(
+                f"WM action_dim mismatch: ckpt={wm_cfg_raw.get('action_dim')} vs env={action_exec_dim}"
+            )
+        wm_cfg = JointWorldModelConfig(
+            state_dim=int(wm_cfg_raw["state_dim"]),
+            action_dim=int(wm_cfg_raw["action_dim"]),
+            hidden_dim=int(wm_cfg_raw.get("hidden_dim", 256)),
+            n_layers=int(wm_cfg_raw.get("n_layers", 1)),
+            stochastic_dim=int(wm_cfg_raw.get("stochastic_dim", 32)),
+            kl_beta=float(wm_cfg_raw.get("kl_beta", 0.1)),
+            free_nats=float(wm_cfg_raw.get("free_nats", 1.0)),
         )
-    if int(wm_cfg_raw.get("state_dim", -1)) != int(global_state_dim):
-        raise ValueError(
-            f"WM state_dim mismatch: ckpt={wm_cfg_raw.get('state_dim')} vs env={global_state_dim}"
+    else:
+        wm_cfg = JointWorldModelConfig(
+            state_dim=int(global_state_dim),
+            action_dim=int(action_exec_dim),
+            hidden_dim=int(wm_hidden_dim),
+            n_layers=int(wm_n_layers),
+            stochastic_dim=int(wm_stochastic_dim),
+            kl_beta=float(wm_kl_beta),
+            free_nats=float(wm_free_nats),
         )
-    if int(wm_cfg_raw.get("action_dim", -1)) != int(action_exec_dim):
-        raise ValueError(
-            f"WM action_dim mismatch: ckpt={wm_cfg_raw.get('action_dim')} vs env={action_exec_dim}"
-        )
-    wm_cfg = JointWorldModelConfig(
-        state_dim=int(wm_cfg_raw["state_dim"]),
-        action_dim=int(wm_cfg_raw["action_dim"]),
-        hidden_dim=int(wm_cfg_raw.get("hidden_dim", 256)),
-        n_layers=int(wm_cfg_raw.get("n_layers", 1)),
-    )
     td_cfg = TDlambdaConfig(gamma=float(gamma), lam=float(lam), rollout_k=int(rollout_k))
     wm_trainer = ValueConsistentWorldModelTrainer(
         wm_cfg=wm_cfg,
@@ -221,12 +251,15 @@ def train_qmix_wm_alternating(
         power_max_dbm=float(env0.uav_power_max),
         device=str(device),
     )
-    wm_ckpt = _load_world_model_weights(
-        wm_trainer,
-        Path(world_model_weights),
-        device=str(device),
-        ckpt=wm_ckpt_raw,
-    )
+    if world_model_weights is not None:
+        wm_ckpt = _load_world_model_weights(
+            wm_trainer,
+            Path(world_model_weights),
+            device=str(device),
+            ckpt=wm_ckpt_raw,
+        )
+    else:
+        wm_ckpt = {}
 
     # Teacher uses QMIX target networks (frozen params).
     value_teacher = MPDQNQMIXValueTeacher(
@@ -420,7 +453,7 @@ def train_qmix_wm_alternating(
         return
 
     # Save standard RL metrics + QMIX weights.
-    save_training_data(
+    _, _, out_dir = save_training_data(
         algorithm=algorithm,
         reward_history=reward_history,
         success_rate_history=success_rate_history,
@@ -432,16 +465,6 @@ def train_qmix_wm_alternating(
     )
 
     # Save extra artifacts (WM weights + combined metrics) in the same experiment dir.
-    repo_root = get_repo_root()
-    base_dir = repo_root / "Draw" / "experiment-data"
-    out_dirs = sorted(
-        [p for p in base_dir.iterdir() if p.is_dir() and p.name.startswith(f"{algorithm}_")],
-        key=lambda p: p.name,
-        reverse=True,
-    )
-    if not out_dirs:
-        return
-    out_dir = out_dirs[0]
 
     # WM weights
     torch.save(
@@ -451,15 +474,19 @@ def train_qmix_wm_alternating(
                 "action_dim": int(wm_cfg.action_dim),
                 "hidden_dim": int(wm_cfg.hidden_dim),
                 "n_layers": int(wm_cfg.n_layers),
+                "stochastic_dim": int(wm_cfg.stochastic_dim),
+                "kl_beta": float(wm_cfg.kl_beta),
+                "free_nats": float(wm_cfg.free_nats),
             },
             "td_cfg": {"gamma": float(gamma), "lam": float(lam), "rollout_k": int(rollout_k)},
             "wm_state_dict": wm_trainer.wm.state_dict(),
             "opt_state_dict": wm_trainer.opt.state_dict(),
             "init_ckpt_meta": {
-                "loaded_from": str(world_model_weights),
+                "loaded_from": (str(world_model_weights) if world_model_weights is not None else None),
                 "orig_td_cfg": wm_ckpt.get("td_cfg", None)
                 if wm_ckpt.get("td_cfg", None) is not None
                 else (wm_ckpt.get("config", {}) or {}).get("td_cfg", None),
+                "initialized_from_scratch": bool(world_model_weights is None),
             },
         },
         str(out_dir / "world_model_weights.pth"),
@@ -470,8 +497,10 @@ def train_qmix_wm_alternating(
         json.dumps(
             {
                 "timestamp": timestamp,
-                "qmix_weights": str(qmix_weights),
-                "world_model_weights": str(world_model_weights),
+                "qmix_weights": (str(qmix_weights) if qmix_weights is not None else None),
+                "world_model_weights": (str(world_model_weights) if world_model_weights is not None else None),
+                "qmix_initialized_from_scratch": bool(qmix_weights is None),
+                "world_model_initialized_from_scratch": bool(world_model_weights is None),
                 "total_episodes": int(total_episodes),
                 "qmix_block_episodes": int(qmix_block_episodes),
                 "wm_block_episodes": int(wm_block_episodes),
@@ -480,6 +509,15 @@ def train_qmix_wm_alternating(
                 "td_cfg": {"gamma": float(gamma), "lam": float(lam), "rollout_k": int(rollout_k)},
                 "seq_len": int(seq_len),
                 "num_envs": int(num_envs),
+                "wm_cfg": {
+                    "state_dim": int(wm_cfg.state_dim),
+                    "action_dim": int(wm_cfg.action_dim),
+                    "hidden_dim": int(wm_cfg.hidden_dim),
+                    "n_layers": int(wm_cfg.n_layers),
+                    "stochastic_dim": int(wm_cfg.stochastic_dim),
+                    "kl_beta": float(wm_cfg.kl_beta),
+                    "free_nats": float(wm_cfg.free_nats),
+                },
             },
             indent=2,
             ensure_ascii=False,
@@ -502,21 +540,14 @@ def train_qmix_wm_alternating(
 
 
 if __name__ == "__main__":
-    repo_root = get_repo_root()
-    default_qmix = _find_latest_weights(
-        repo_root=repo_root,
-        prefix="mpdqn_qmix_",
-        filename="mpdqn_qmix_weights.pth",
+    parser = argparse.ArgumentParser(description="Alternating QMIX<->WorldModel training (from scratch or resume)")
+    parser.add_argument("--qmix-weights", type=str, default=None, help="Optional QMIX checkpoint to resume from")
+    parser.add_argument(
+        "--world-model-weights",
+        type=str,
+        default=None,
+        help="Optional RSSM world model checkpoint to resume from",
     )
-    default_wm = _find_latest_weights(
-        repo_root=repo_root,
-        prefix="world_model_gru_",
-        filename="world_model_weights.pth",
-    )
-
-    parser = argparse.ArgumentParser(description="Alternating QMIX<->WorldModel training (50ep blocks)")
-    parser.add_argument("--qmix-weights", type=str, default=str(default_qmix))
-    parser.add_argument("--world-model-weights", type=str, default=str(default_wm))
 
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--qmix-block", type=int, default=50)
@@ -536,12 +567,17 @@ if __name__ == "__main__":
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-save", action="store_true")
 
-    parser.add_argument("--alpha-model", type=float, default=0.3)
+    parser.add_argument("--alpha-model", type=float, default=0.01)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=0.8)
     parser.add_argument("--rollout-k", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--wm-buffer-capacity", type=int, default=500_000)
+    parser.add_argument("--wm-hidden-dim", type=int, default=256)
+    parser.add_argument("--wm-n-layers", type=int, default=1)
+    parser.add_argument("--wm-stochastic-dim", type=int, default=32)
+    parser.add_argument("--wm-kl-beta", type=float, default=0.1)
+    parser.add_argument("--wm-free-nats", type=float, default=1.0)
 
     parser.add_argument("--wm-lr", type=float, default=1e-3)
     parser.add_argument("--wm-batch-size", type=int, default=512)
@@ -552,12 +588,13 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-start", type=float, default=0.2)
     parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--epsilon-decay", type=float, default=0.995)
+    parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
 
     train_qmix_wm_alternating(
-        qmix_weights=str(args.qmix_weights),
-        world_model_weights=str(args.world_model_weights),
+        qmix_weights=args.qmix_weights,
+        world_model_weights=args.world_model_weights,
         total_episodes=int(args.episodes),
         qmix_block_episodes=int(args.qmix_block),
         wm_block_episodes=int(args.wm_block),
@@ -580,6 +617,11 @@ if __name__ == "__main__":
         rollout_k=int(args.rollout_k),
         seq_len=int(args.seq_len),
         wm_buffer_capacity=int(args.wm_buffer_capacity),
+        wm_hidden_dim=int(args.wm_hidden_dim),
+        wm_n_layers=int(args.wm_n_layers),
+        wm_stochastic_dim=int(args.wm_stochastic_dim),
+        wm_kl_beta=float(args.wm_kl_beta),
+        wm_free_nats=float(args.wm_free_nats),
         wm_lr=float(args.wm_lr),
         wm_batch_size=int(args.wm_batch_size),
         wm_updates_per_learn=int(args.wm_updates_per_learn),
@@ -589,4 +631,6 @@ if __name__ == "__main__":
         epsilon_min=float(args.epsilon_min),
         epsilon_decay=float(args.epsilon_decay),
         save_data=not bool(args.no_save),
+        seed=int(args.seed),
     )
+
