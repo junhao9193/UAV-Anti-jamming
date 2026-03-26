@@ -5,7 +5,7 @@ from typing import Tuple
 
 import torch
 
-from algorithms.mpdqn.qmix.trainer import MPDQNQMIXTrainer
+from algorithms.mpdqn.qmix.trainer_greedy_actor import MPDQNQMIXTrainer
 
 
 @dataclass(frozen=True)

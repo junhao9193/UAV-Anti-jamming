@@ -18,6 +18,8 @@ class JointWorldModelConfig:
     min_std: float = 0.1
     kl_beta: float = 0.1
     free_nats: float = 1.0
+    state_clip_low: float = -1.0
+    state_clip_high: float = 1.0
 
 
 @dataclass
@@ -65,6 +67,8 @@ class JointWorldModel(nn.Module):
         self.min_std = float(cfg.min_std)
         self.kl_beta = float(cfg.kl_beta)
         self.free_nats = float(cfg.free_nats)
+        self.state_clip_low = float(cfg.state_clip_low)
+        self.state_clip_high = float(cfg.state_clip_high)
 
         if self.n_layers <= 0:
             raise ValueError("n_layers must be positive")
@@ -72,6 +76,8 @@ class JointWorldModel(nn.Module):
             raise ValueError("stochastic_dim must be positive")
         if self.min_std <= 0.0:
             raise ValueError("min_std must be positive")
+        if self.state_clip_low >= self.state_clip_high:
+            raise ValueError("state_clip_low must be smaller than state_clip_high")
 
         self.action_embed = nn.Sequential(
             nn.Linear(self.action_dim, self.hidden_dim),
@@ -247,7 +253,7 @@ class JointWorldModel(nn.Module):
         feat = self._feature_from_hidden(hidden)
         delta = self.head_state(feat)
         reward = self.head_reward(feat)
-        next_state = state + delta
+        next_state = torch.clamp(state + delta, min=self.state_clip_low, max=self.state_clip_high)
         return next_state, reward
 
     def imagine_step(

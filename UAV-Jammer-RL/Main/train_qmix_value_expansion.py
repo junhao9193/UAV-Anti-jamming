@@ -91,7 +91,8 @@ def train_qmix_value_expansion(
     wm_stochastic_dim: int = 32,
     wm_kl_beta: float = 0.1,
     wm_free_nats: float = 1.0,
-    wm_lr: float = 1e-3,
+    wm_lr: float = 3e-4,
+    wm_max_grad_norm: float = 10.0,
     wm_batch_size: int = 512,
     wm_updates_per_learn: int = 2,
     # TD(lambda)
@@ -197,6 +198,7 @@ def train_qmix_value_expansion(
         eta=0.0,  # scheduled
         td_cfg=td_cfg_obj,
         lr=float(wm_lr),
+        max_grad_norm=float(wm_max_grad_norm),
         power_min_dbm=float(env0.uav_power_min),
         power_max_dbm=float(env0.uav_power_max),
         device=str(device),
@@ -456,7 +458,8 @@ if __name__ == "__main__":
     parser.add_argument("--wm-stochastic-dim", type=int, default=32)
     parser.add_argument("--wm-kl-beta", type=float, default=0.1)
     parser.add_argument("--wm-free-nats", type=float, default=1.0)
-    parser.add_argument("--wm-lr", type=float, default=1e-3)
+    parser.add_argument("--wm-lr", type=float, default=3e-4)
+    parser.add_argument("--wm-max-grad-norm", type=float, default=10.0)
     parser.add_argument("--wm-batch-size", type=int, default=512)
     parser.add_argument("--wm-updates-per-learn", type=int, default=2)
 
@@ -502,6 +505,7 @@ if __name__ == "__main__":
         wm_kl_beta=float(args.wm_kl_beta),
         wm_free_nats=float(args.wm_free_nats),
         wm_lr=float(args.wm_lr),
+        wm_max_grad_norm=float(args.wm_max_grad_norm),
         wm_batch_size=int(args.wm_batch_size),
         wm_updates_per_learn=int(args.wm_updates_per_learn),
         gamma=float(args.gamma),

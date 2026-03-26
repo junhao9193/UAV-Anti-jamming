@@ -46,6 +46,7 @@ class MPDQNQMIXTrainer:
         hypernet_hidden_dim: int = 64,
         use_amp: bool = False,
         max_grad_norm: float = 10.0,
+        value_target_clip: Optional[float] = 1000.0,
         device: Optional[str] = None,
     ):
         self.n_agents = int(n_agents)
@@ -69,6 +70,7 @@ class MPDQNQMIXTrainer:
         else:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.max_grad_norm = float(max_grad_norm)
+        self.value_target_clip = None if value_target_clip is None else float(value_target_clip)
 
         if lr_mixer is None:
             lr_mixer = float(lr_q)
@@ -102,6 +104,11 @@ class MPDQNQMIXTrainer:
 
         self.buffer = MPDQNJointReplayBuffer(capacity=int(buffer_capacity))
         self.learn_steps = 0
+
+    def _clip_value_target(self, x: torch.Tensor) -> torch.Tensor:
+        if self.value_target_clip is None or self.value_target_clip <= 0.0:
+            return x
+        return torch.clamp(x, min=-self.value_target_clip, max=self.value_target_clip)
 
     def select_actions(self, states: List[np.ndarray], epsilon: float) -> List[Tuple[int, np.ndarray]]:
         if len(states) != self.n_agents:
@@ -192,6 +199,7 @@ class MPDQNQMIXTrainer:
                 next_agent_qs = torch.cat(next_q_list, dim=1)  # (B,N)
                 next_q_tot = self.target_mixer(next_agent_qs, next_global_state)  # (B,1)
                 td_target = reward + (1.0 - done) * self.gamma * next_q_tot
+                td_target = self._clip_value_target(td_target)
 
             loss_q = F.smooth_l1_loss(q_tot, td_target)
 
@@ -422,6 +430,7 @@ class MPDQNQMIXTrainer:
                 next_agent_qs = torch.cat(next_q_list, dim=1)  # (B,N)
                 next_q_tot = self.target_mixer(next_agent_qs, next_global_state)  # (B,1)
                 y_real = reward + (1.0 - done) * self.gamma * next_q_tot
+                y_real = self._clip_value_target(y_real)
 
                 if alpha_model > 0.0:
                     # y_model = model TD(lambda) return (no grad for critic update)
@@ -448,9 +457,14 @@ class MPDQNQMIXTrainer:
                         q_tot_target_fn=value_teacher.q_tot_target,
                         cfg=td_cfg,
                     )
-                    td_target = (1.0 - alpha_model) * y_real + alpha_model * y_model
+                    y_model = self._clip_value_target(y_model)
+                    if torch.isfinite(y_model).all():
+                        td_target = (1.0 - alpha_model) * y_real + alpha_model * y_model
+                    else:
+                        td_target = y_real
                 else:
                     td_target = y_real
+                td_target = self._clip_value_target(td_target)
 
             loss_q = F.smooth_l1_loss(q_tot, td_target)
 

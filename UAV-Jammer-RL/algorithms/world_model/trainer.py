@@ -47,6 +47,8 @@ class ValueConsistentWorldModelTrainer:
         eta: float = 0.0,
         td_cfg: Optional[TDlambdaConfig] = None,
         lr: float = 1e-3,
+        max_grad_norm: float = 10.0,
+        value_clip: float | None = 1000.0,
         power_min_dbm: float | None = None,
         power_max_dbm: float | None = None,
         device: str | None = None,
@@ -72,6 +74,17 @@ class ValueConsistentWorldModelTrainer:
         self.power_max_dbm = float(power_max_dbm) if power_max_dbm is not None else None
         self.kl_beta = float(self.wm.cfg.kl_beta)
         self.free_nats = float(self.wm.cfg.free_nats)
+        self.max_grad_norm = float(max_grad_norm)
+        self.value_clip = None if value_clip is None else float(value_clip)
+
+    @staticmethod
+    def _robust_loss(pred: torch.Tensor, target: torch.Tensor, *, beta: float = 1.0) -> torch.Tensor:
+        return F.smooth_l1_loss(pred, target, beta=float(beta))
+
+    def _clip_value_target(self, x: torch.Tensor) -> torch.Tensor:
+        if self.value_clip is None or self.value_clip <= 0.0:
+            return x
+        return torch.clamp(x, min=-self.value_clip, max=self.value_clip)
 
     def _encode_actions_seq(self, action_discrete_seq: torch.Tensor, action_params_seq: torch.Tensor) -> torch.Tensor:
         if action_discrete_seq.ndim != 3:
@@ -154,8 +167,8 @@ class ValueConsistentWorldModelTrainer:
         delta_pred = obs.delta_seq
         reward_pred = obs.reward_seq
 
-        loss_state = F.mse_loss(delta_pred, delta_true)
-        loss_reward = F.mse_loss(reward_pred, reward_seq)
+        loss_state = self._robust_loss(delta_pred, delta_true)
+        loss_reward = self._robust_loss(reward_pred, reward_seq)
         loss_kl = self._kl_loss(obs.prior_mean_seq, obs.prior_std_seq, obs.post_mean_seq, obs.post_std_seq)
 
         loss_vc = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -193,7 +206,9 @@ class ValueConsistentWorldModelTrainer:
                 q_tot_target_fn=value_teacher.q_tot_target,
                 cfg=self.td_cfg,
             )
-            loss_vc = F.mse_loss(q_teacher, g_lambda)
+            q_teacher = self._clip_value_target(q_teacher)
+            g_lambda = self._clip_value_target(g_lambda)
+            loss_vc = self._robust_loss(q_teacher, g_lambda, beta=10.0)
             debug.update(
                 {
                     "q_teacher_mean": float(q_teacher.mean().item()),
@@ -239,8 +254,19 @@ class ValueConsistentWorldModelTrainer:
         delta_pred = obs.delta_seq
         reward_pred = obs.reward_seq
 
-        loss_state = F.mse_loss(delta_pred, delta_true)
-        loss_reward = F.mse_loss(reward_pred, reward_seq)
+        if not torch.isfinite(delta_pred).all() or not torch.isfinite(reward_pred).all():
+            self.opt.zero_grad(set_to_none=True)
+            losses = WorldModelLosses(
+                loss_state=float("inf"),
+                loss_reward=float("inf"),
+                loss_kl=float("inf"),
+                loss_vc=float("inf"),
+                loss_total=float("inf"),
+            )
+            return losses, {"skipped_nonfinite_outputs": True}
+
+        loss_state = self._robust_loss(delta_pred, delta_true)
+        loss_reward = self._robust_loss(reward_pred, reward_seq)
         loss_kl = self._kl_loss(obs.prior_mean_seq, obs.prior_std_seq, obs.post_mean_seq, obs.post_std_seq)
         loss_vc = torch.zeros((), dtype=torch.float32, device=self.device)
 
@@ -279,18 +305,49 @@ class ValueConsistentWorldModelTrainer:
                 q_tot_target_fn=value_teacher.q_tot_target,
                 cfg=self.td_cfg,
             )
-            loss_vc = F.mse_loss(q_teacher, g_lambda)
-            loss_total = loss_total + self.eta * loss_vc
-            debug.update(
-                {
-                    "q_teacher_mean": float(q_teacher.mean().item()),
-                    "g_lambda_mean": float(g_lambda.mean().item()),
-                    "rewards_hat_mean": float(rewards_hat.mean().item()),
-                }
+            if torch.isfinite(q_teacher).all() and torch.isfinite(g_lambda).all():
+                q_teacher = self._clip_value_target(q_teacher)
+                g_lambda = self._clip_value_target(g_lambda)
+                loss_vc = self._robust_loss(q_teacher, g_lambda, beta=10.0)
+                loss_total = loss_total + self.eta * loss_vc
+                debug.update(
+                    {
+                        "q_teacher_mean": float(q_teacher.mean().item()),
+                        "g_lambda_mean": float(g_lambda.mean().item()),
+                        "rewards_hat_mean": float(rewards_hat.mean().item()),
+                    }
+                )
+            else:
+                debug["skipped_nonfinite_vc"] = True
+
+        if not torch.isfinite(loss_total):
+            self.opt.zero_grad(set_to_none=True)
+            losses = WorldModelLosses(
+                loss_state=float(loss_state.item()),
+                loss_reward=float(loss_reward.item()),
+                loss_kl=float(loss_kl.item()),
+                loss_vc=float(loss_vc.item()),
+                loss_total=float("inf"),
             )
+            return losses, {**debug, "skipped_nonfinite_loss": True}
 
         loss_total.backward()
+        grad_norm = None
+        if self.max_grad_norm > 0.0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.wm.parameters(), self.max_grad_norm)
+            if not torch.isfinite(torch.as_tensor(grad_norm)):
+                self.opt.zero_grad(set_to_none=True)
+                losses = WorldModelLosses(
+                    loss_state=float(loss_state.item()),
+                    loss_reward=float(loss_reward.item()),
+                    loss_kl=float(loss_kl.item()),
+                    loss_vc=float(loss_vc.item()),
+                    loss_total=float("inf"),
+                )
+                return losses, {**debug, "skipped_nonfinite_grad": True}
         self.opt.step()
+        if grad_norm is not None:
+            debug["grad_norm"] = float(torch.as_tensor(grad_norm).item())
 
         losses = WorldModelLosses(
             loss_state=float(loss_state.item()),

@@ -32,6 +32,13 @@ from envs import Environ
 from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, save_training_data
 
 
+def _linear_ramp(t: int, *, t0: int, t1: int, v_max: float) -> float:
+    if t1 <= t0:
+        return float(v_max) if int(t) >= int(t0) else 0.0
+    frac = (float(t) - float(t0)) / (float(t1) - float(t0))
+    return float(v_max) * float(np.clip(frac, 0.0, 1.0))
+
+
 def _find_latest_weights(*, repo_root: Path, prefix: str, filename: str) -> Path:
     base_dir = repo_root / "Draw" / "experiment-data"
     if not base_dir.exists():
@@ -123,12 +130,15 @@ def train_qmix_wm_alternating(
     wm_stochastic_dim: int = 32,
     wm_kl_beta: float = 0.1,
     wm_free_nats: float = 1.0,
+    wm_max_grad_norm: float = 10.0,
     # World model training
-    wm_lr: float = 1e-3,
+    wm_lr: float = 3e-4,
     wm_batch_size: int = 512,
     wm_updates_per_learn: int = 2,
     wm_alpha_r: float = 1.0,
     wm_eta_vc: float = 0.2,
+    wm_vc_warmup_ep: int = 300,
+    wm_vc_ramp_end_ep: int = 800,
     # Behavior policy
     epsilon_start: float = 0.2,
     epsilon_min: float = 0.01,
@@ -244,9 +254,10 @@ def train_qmix_wm_alternating(
         n_actions=int(env0.action_dim),
         param_dim=int(env0.param_dim_per_action),
         alpha=float(wm_alpha_r),
-        eta=float(wm_eta_vc),
+        eta=0.0,
         td_cfg=td_cfg,
         lr=float(wm_lr),
+        max_grad_norm=float(wm_max_grad_norm),
         power_min_dbm=float(env0.uav_power_min),
         power_max_dbm=float(env0.uav_power_max),
         device=str(device),
@@ -301,6 +312,13 @@ def train_qmix_wm_alternating(
             train_wm = not bool(train_qmix)
             phase = "qmix" if bool(train_qmix) else "wm"
             phase_history.append(phase)
+            wm_eta_now = _linear_ramp(
+                int(ep),
+                t0=int(wm_vc_warmup_ep),
+                t1=int(wm_vc_ramp_end_ep),
+                v_max=float(wm_eta_vc),
+            )
+            wm_trainer.eta = float(wm_eta_now)
 
             # Purely for clarity/debug: set modes (no dropout/bn here, but keeps intent clear).
             if bool(train_qmix):
@@ -376,7 +394,7 @@ def train_qmix_wm_alternating(
                                 action_params_seq=torch.from_numpy(batch["action_params_seq"]),
                                 reward_seq=torch.from_numpy(batch["reward_seq"]),
                                 next_state_seq=torch.from_numpy(batch["next_state_seq"]),
-                                value_teacher=value_teacher,
+                                value_teacher=(value_teacher if float(wm_eta_now) > 0.0 else None),
                             )
                             wm_loss_sum += float(losses.loss_total)
                             wm_vc_sum += float(losses.loss_vc)
@@ -440,7 +458,7 @@ def train_qmix_wm_alternating(
                 sr=float(success_rate_history[-1]),
                 eps=float(epsilon),
                 alpha=float(alpha_model),
-                eta=float(wm_eta_vc),
+                eta=float(wm_eta_now),
                 qloss=float(qmix_loss_q_history[-1]),
                 wm=float(wm_loss_total_history[-1]),
                 lvc=float(wm_loss_vc_history[-1]),
@@ -506,6 +524,9 @@ def train_qmix_wm_alternating(
                 "wm_block_episodes": int(wm_block_episodes),
                 "alpha_model": float(alpha_model),
                 "wm_eta_vc": float(wm_eta_vc),
+                "wm_vc_warmup_ep": int(wm_vc_warmup_ep),
+                "wm_vc_ramp_end_ep": int(wm_vc_ramp_end_ep),
+                "wm_max_grad_norm": float(wm_max_grad_norm),
                 "td_cfg": {"gamma": float(gamma), "lam": float(lam), "rollout_k": int(rollout_k)},
                 "seq_len": int(seq_len),
                 "num_envs": int(num_envs),
@@ -579,11 +600,14 @@ if __name__ == "__main__":
     parser.add_argument("--wm-kl-beta", type=float, default=0.1)
     parser.add_argument("--wm-free-nats", type=float, default=1.0)
 
-    parser.add_argument("--wm-lr", type=float, default=1e-3)
+    parser.add_argument("--wm-lr", type=float, default=3e-4)
+    parser.add_argument("--wm-max-grad-norm", type=float, default=10.0)
     parser.add_argument("--wm-batch-size", type=int, default=512)
     parser.add_argument("--wm-updates-per-learn", type=int, default=2)
     parser.add_argument("--wm-alpha-r", type=float, default=1.0)
     parser.add_argument("--wm-eta-vc", type=float, default=0.2)
+    parser.add_argument("--wm-vc-warmup-ep", type=int, default=300)
+    parser.add_argument("--wm-vc-ramp-end-ep", type=int, default=800)
 
     parser.add_argument("--epsilon-start", type=float, default=0.2)
     parser.add_argument("--epsilon-min", type=float, default=0.01)
@@ -623,10 +647,13 @@ if __name__ == "__main__":
         wm_kl_beta=float(args.wm_kl_beta),
         wm_free_nats=float(args.wm_free_nats),
         wm_lr=float(args.wm_lr),
+        wm_max_grad_norm=float(args.wm_max_grad_norm),
         wm_batch_size=int(args.wm_batch_size),
         wm_updates_per_learn=int(args.wm_updates_per_learn),
         wm_alpha_r=float(args.wm_alpha_r),
         wm_eta_vc=float(args.wm_eta_vc),
+        wm_vc_warmup_ep=int(args.wm_vc_warmup_ep),
+        wm_vc_ramp_end_ep=int(args.wm_vc_ramp_end_ep),
         epsilon_start=float(args.epsilon_start),
         epsilon_min=float(args.epsilon_min),
         epsilon_decay=float(args.epsilon_decay),

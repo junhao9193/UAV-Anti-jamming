@@ -23,6 +23,13 @@ from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, make_u
 from tqdm.auto import trange
 
 
+def _linear_ramp(t: int, *, t0: int, t1: int, v_max: float) -> float:
+    if t1 <= t0:
+        return float(v_max) if int(t) >= int(t0) else 0.0
+    frac = (float(t) - float(t0)) / (float(t1) - float(t0))
+    return float(v_max) * float(np.clip(frac, 0.0, 1.0))
+
+
 def _find_latest_qmix_weights(repo_root: Path) -> Path:
     base_dir = repo_root / "Draw" / "experiment-data"
     if not base_dir.exists():
@@ -143,12 +150,15 @@ def train_world_model(
     stochastic_dim: int = 32,
     kl_beta: float = 0.1,
     free_nats: float = 1.0,
-    lr: float = 1e-3,
+    lr: float = 3e-4,
+    max_grad_norm: float = 10.0,
     alpha: float = 1.0,
     eta: float = 0.2,
     gamma: float = 0.99,
     lam: float = 0.8,
     rollout_k: int = 4,
+    vc_warmup_ep: int = 300,
+    vc_ramp_end_ep: int = 800,
     seed: int = 0,
     qmix_weights: Optional[str] = None,
     epsilon: float = 0.05,
@@ -228,6 +238,7 @@ def train_world_model(
         eta=float(eta),
         td_cfg=td_cfg,
         lr=float(lr),
+        max_grad_norm=float(max_grad_norm),
         power_min_dbm=float(env0.uav_power_min),
         power_max_dbm=float(env0.uav_power_max),
         device=str(device),
@@ -277,6 +288,8 @@ def train_world_model(
     try:
         pbar = trange(n_episode, desc="Training(World-Model-RSSM)", unit="ep", ascii=True)
         for episode in pbar:
+            eta_now = _linear_ramp(int(episode), t0=int(vc_warmup_ep), t1=int(vc_ramp_end_ep), v_max=float(eta))
+            wm_trainer.eta = float(eta_now)
             states = vecenv.reset()  # (E,N,S)
             global_states = states.reshape(n_envs, -1).astype(np.float32)  # (E,Ds)
 
@@ -314,7 +327,7 @@ def train_world_model(
                             action_params_seq=torch.from_numpy(batch["action_params_seq"]),
                             reward_seq=torch.from_numpy(batch["reward_seq"]),
                             next_state_seq=torch.from_numpy(batch["next_state_seq"]),
-                            value_teacher=value_teacher,
+                            value_teacher=(value_teacher if float(eta_now) > 0.0 else None),
                         )
                         loss_state_sum += float(losses.loss_state)
                         loss_reward_sum += float(losses.loss_reward)
@@ -356,6 +369,9 @@ def train_world_model(
                     "L": f"{(loss_total_sum / loss_count):.4f}",
                     "L_s": f"{(loss_state_sum / loss_count):.4f}",
                     "L_r": f"{(loss_reward_sum / loss_count):.4f}",
+                    "L_kl": f"{(loss_kl_sum / loss_count):.4f}",
+                    "L_vc": f"{(loss_vc_sum / loss_count):.4f}",
+                    "eta": f"{eta_now:.3f}",
                     "envs": str(n_envs),
                 }
             )
@@ -377,6 +393,9 @@ def train_world_model(
         "kl_beta": float(kl_beta),
         "free_nats": float(free_nats),
         "epsilon": float(epsilon),
+        "max_grad_norm": float(max_grad_norm),
+        "vc_warmup_ep": int(vc_warmup_ep),
+        "vc_ramp_end_ep": int(vc_ramp_end_ep),
         "start_method": str(start_method),
         "wm_cfg": asdict(wm_cfg),
         "td_cfg": asdict(td_cfg),
@@ -425,12 +444,15 @@ if __name__ == "__main__":
     parser.add_argument('--stochastic-dim', type=int, default=32)
     parser.add_argument('--kl-beta', type=float, default=0.1)
     parser.add_argument('--free-nats', type=float, default=1.0)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--max-grad-norm', type=float, default=10.0)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=0.8)
     parser.add_argument("--rollout-k", type=int, default=4)
+    parser.add_argument("--vc-warmup-ep", type=int, default=300)
+    parser.add_argument("--vc-ramp-end-ep", type=int, default=800)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--qmix-weights",
@@ -459,11 +481,14 @@ if __name__ == "__main__":
         kl_beta=float(args.kl_beta),
         free_nats=float(args.free_nats),
         lr=float(args.lr),
+        max_grad_norm=float(args.max_grad_norm),
         alpha=float(args.alpha),
         eta=float(args.eta),
         gamma=float(args.gamma),
         lam=float(args.lam),
         rollout_k=int(args.rollout_k),
+        vc_warmup_ep=int(args.vc_warmup_ep),
+        vc_ramp_end_ep=int(args.vc_ramp_end_ep),
         seed=int(args.seed),
         qmix_weights=(str(args.qmix_weights) if args.qmix_weights is not None else None),
         epsilon=float(args.epsilon),
