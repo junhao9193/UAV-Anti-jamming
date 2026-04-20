@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing as mp
 from datetime import datetime
@@ -13,6 +14,86 @@ def get_repo_root() -> Path:
     # .../MetaRL-for-UAV-Anti-jamming/UAV-Jammer-RL/Main/common.py -> repo root is parents[2]
     # NOTE: use `absolute()` (not `resolve()`) to avoid following Windows junctions/symlinks.
     return Path(__file__).absolute().parents[2]
+
+
+def get_project_root() -> Path:
+    """Return the `UAV-Jammer-RL/` project root."""
+    return Path(__file__).absolute().parents[1]
+
+
+def resolve_env_config_path(config_path: Optional[str] = None) -> Optional[str]:
+    """Return an absolute env config path, defaulting to `configs/env.yaml` when present."""
+    if config_path is None:
+        default_path = get_project_root() / "configs" / "env.yaml"
+        return str(default_path.absolute()) if default_path.exists() else None
+
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).absolute()
+    if not path.exists():
+        raise FileNotFoundError(f"env config file not found: {path}")
+    return str(path)
+
+
+def _file_sha256(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
+    """Small, stable metadata snapshot for comparing experiments across env configs."""
+    resolved = resolve_env_config_path(config_path)
+    keys = [
+        "n_ch",
+        "n_des",
+        "n_jammer",
+        "n_channel",
+        "state_dim",
+        "action_dim",
+        "param_dim_per_action",
+        "total_param_dim",
+        "p_trans_mode",
+        "p_trans_seed",
+        "jammer_modes",
+        "jammer_mode_switch_prob",
+        "jammer_reactive_beta",
+        "uav_interference_scale",
+        "reward_energy_weight",
+        "reward_jump_weight",
+        "fairness_min_success_rate",
+        "fairness_weight",
+        "enable_fast_fading",
+        "fast_fading_rho",
+    ]
+    summary = {}
+    for key in keys:
+        if hasattr(env, key):
+            val = getattr(env, key)
+            if isinstance(val, np.generic):
+                val = val.item()
+            summary[key] = val
+    return {
+        "env_config_path": resolved,
+        "env_config_sha256": _file_sha256(resolved),
+        "env_summary": summary,
+    }
+
+
+def validate_positive_run_args(*, n_episode: int, n_steps: int, num_envs: int) -> None:
+    if int(n_episode) <= 0:
+        raise ValueError(f"n_episode/episodes must be positive, got {n_episode}")
+    if int(n_steps) <= 0:
+        raise ValueError(f"n_steps/steps must be positive, got {n_steps}")
+    if int(num_envs) <= 0:
+        raise ValueError(f"num_envs must be positive, got {num_envs}")
 
 
 def make_unique_output_dir(base_dir: Path, prefix: str) -> Path:
@@ -44,6 +125,8 @@ def save_training_data(
     n_episode: int,
     n_steps: int,
     trainer: Optional[Any] = None,
+    run_config: Optional[dict] = None,
+    artifact_kind: str = "train",
 ) -> Tuple[str, str, Path]:
     """Save metrics to `Draw/experiment-data/{algorithm}_{timestamp}/` under repo root (json + npz + png).
 
@@ -58,17 +141,38 @@ def save_training_data(
     data_dir = make_unique_output_dir(base_dir, algorithm)
     timestamp = data_dir.name.removeprefix(f"{algorithm}_")
 
-    json_path = data_dir / "training_data.json"
-    npz_path = data_dir / "training_data.npz"
-    png_path = data_dir / "training_metrics.png"
+    artifact_kind = str(artifact_kind).lower()
+    if artifact_kind not in {"train", "eval"}:
+        raise ValueError(f"artifact_kind must be 'train' or 'eval', got {artifact_kind!r}")
+    stem = "evaluation" if artifact_kind == "eval" else "training"
+
+    json_path = data_dir / f"{stem}_data.json"
+    npz_path = data_dir / f"{stem}_data.npz"
+    png_path = data_dir / f"{stem}_metrics.png"
+
+    def _json_safe(x):
+        if isinstance(x, dict):
+            return {str(k): _json_safe(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [_json_safe(v) for v in x]
+        if isinstance(x, np.generic):
+            return x.item()
+        if isinstance(x, Path):
+            return str(x)
+        return x
+
+    config_data = {
+        "n_episode": int(n_episode),
+        "n_steps": int(n_steps),
+        "artifact_kind": artifact_kind,
+    }
+    if run_config is not None:
+        config_data.update(_json_safe(run_config))
 
     data = {
         "algorithm": algorithm,
         "timestamp": timestamp,
-        "config": {
-            "n_episode": int(n_episode),
-            "n_steps": int(n_steps),
-        },
+        "config": config_data,
         "metrics": {
             "reward": [float(x) for x in reward_history],
             "success_rate": [float(x) for x in success_rate_history],
@@ -78,6 +182,11 @@ def save_training_data(
     }
 
     json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    if run_config is not None:
+        (data_dir / "run_config.json").write_text(
+            json.dumps(config_data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     np.savez(
         str(npz_path),
         reward=np.asarray(reward_history, dtype=np.float32),
@@ -86,7 +195,7 @@ def save_training_data(
         jump=np.asarray(jump_history, dtype=np.float32),
     )
 
-    print("Training data saved to:")
+    print(("Evaluation" if artifact_kind == "eval" else "Training") + " data saved to:")
     print(f"  JSON: {json_path}")
     print(f"  NPZ:  {npz_path}")
 
@@ -95,6 +204,7 @@ def save_training_data(
             reward=np.asarray(reward_history, dtype=np.float32),
             success_rate=np.asarray(success_rate_history, dtype=np.float32),
             algorithm=algorithm,
+            title_prefix="Evaluation Metrics" if artifact_kind == "eval" else "Training Metrics",
             save_path=str(png_path),
         )
         print(f"  PNG:  {png_path}")
@@ -156,12 +266,20 @@ def _save_model_weights(trainer: Any, data_dir: Path, algorithm: str) -> str:
             }
 
         if hasattr(trainer, "mixer") and trainer.mixer is not None:
-            checkpoint["mixer"] = trainer.mixer.state_dict()
-            checkpoint["target_mixer"] = trainer.target_mixer.state_dict()
-            checkpoint["mixer_config"] = {
-                "n_agents": trainer.n_agents,
-                "global_state_dim": trainer.global_state_dim,
+            mixer = trainer.mixer
+            checkpoint["mixer"] = mixer.state_dict()
+            if hasattr(trainer, "target_mixer") and trainer.target_mixer is not None:
+                checkpoint["target_mixer"] = trainer.target_mixer.state_dict()
+
+            mixer_config = {
+                "mixer_class": mixer.__class__.__name__,
+                "n_agents": int(getattr(trainer, "n_agents")),
+                "global_state_dim": int(getattr(trainer, "global_state_dim")),
             }
+            for attr in ("mixing_hidden_dim", "hypernet_hidden_dim", "n_heads"):
+                if hasattr(mixer, attr):
+                    mixer_config[attr] = int(getattr(mixer, attr))
+            checkpoint["mixer_config"] = mixer_config
 
     # MAPPO shared-parameter agent: actor + critic only.
     elif hasattr(trainer, "actor") and hasattr(trainer, "critic"):
@@ -185,7 +303,13 @@ def _save_model_weights(trainer: Any, data_dir: Path, algorithm: str) -> str:
     return str(weights_path)
 
 
-def _plot_metrics_png(reward: np.ndarray, success_rate: np.ndarray, algorithm: str, save_path: str) -> None:
+def _plot_metrics_png(
+    reward: np.ndarray,
+    success_rate: np.ndarray,
+    algorithm: str,
+    save_path: str,
+    title_prefix: str = "Training Metrics",
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -201,7 +325,7 @@ def _plot_metrics_png(reward: np.ndarray, success_rate: np.ndarray, algorithm: s
 
     episodes = np.arange(len(reward))
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle(f"Training Metrics - {algorithm}", fontsize=12)
+    fig.suptitle(f"{title_prefix} - {algorithm}", fontsize=12)
 
     axes[0].plot(episodes, reward, alpha=0.25, color="blue", label="Raw")
     axes[0].plot(episodes, smooth(reward), color="blue", linewidth=2, label="Smoothed")
@@ -372,4 +496,14 @@ class SubprocVecEnv:
                 pass
 
 
-__all__ = ["get_repo_root", "make_unique_output_dir", "save_training_data", "make_fixed_p_trans", "SubprocVecEnv"]
+__all__ = [
+    "get_repo_root",
+    "get_project_root",
+    "resolve_env_config_path",
+    "env_run_config",
+    "validate_positive_run_args",
+    "make_unique_output_dir",
+    "save_training_data",
+    "make_fixed_p_trans",
+    "SubprocVecEnv",
+]

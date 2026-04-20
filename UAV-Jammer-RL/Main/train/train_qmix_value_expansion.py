@@ -9,7 +9,7 @@ Implements the alternating loop described in `doc/价值一致性世界模型.md
   Step 4: curriculum schedule for α(t), η(t)
 
 Run from `UAV-Jammer-RL/`:
-  python -m Main.train_qmix_value_expansion
+  python -m Main.train.train_qmix_value_expansion
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ Replay stores only (s, u, r, s', done, env_id) per step, then samples contiguous
 sequences by `env_id` for RNN training and value-consistency regularization.
 
 Run from `UAV-Jammer-RL/`:
-  python -m Main.train_world_model
+  python -m Main.train.train_world_model
 """
 
 from __future__ import annotations

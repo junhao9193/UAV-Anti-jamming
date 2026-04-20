@@ -2,7 +2,7 @@
 MAPPO training script (shared actor + centralized critic).
 
 Run from `UAV-Jammer-RL/`:
-  python -m Main.train_mappo
+  python -m Main.train.train_mappo
 """
 from __future__ import division
 

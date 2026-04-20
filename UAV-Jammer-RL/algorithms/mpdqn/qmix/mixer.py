@@ -23,23 +23,24 @@ class QMIXMixer(nn.Module):
         self.n_agents = int(n_agents)
         self.global_state_dim = int(global_state_dim)
         self.mixing_hidden_dim = int(mixing_hidden_dim)
+        self.hypernet_hidden_dim = int(hypernet_hidden_dim)
 
         self.hyper_w1 = nn.Sequential(
-            nn.Linear(self.global_state_dim, int(hypernet_hidden_dim)),
+            nn.Linear(self.global_state_dim, self.hypernet_hidden_dim),
             nn.ReLU(),
-            nn.Linear(int(hypernet_hidden_dim), self.n_agents * self.mixing_hidden_dim),
+            nn.Linear(self.hypernet_hidden_dim, self.n_agents * self.mixing_hidden_dim),
         )
         self.hyper_b1 = nn.Linear(self.global_state_dim, self.mixing_hidden_dim)
 
         self.hyper_w2 = nn.Sequential(
-            nn.Linear(self.global_state_dim, int(hypernet_hidden_dim)),
+            nn.Linear(self.global_state_dim, self.hypernet_hidden_dim),
             nn.ReLU(),
-            nn.Linear(int(hypernet_hidden_dim), self.mixing_hidden_dim * 1),
+            nn.Linear(self.hypernet_hidden_dim, self.mixing_hidden_dim * 1),
         )
         self.hyper_b2 = nn.Sequential(
-            nn.Linear(self.global_state_dim, int(hypernet_hidden_dim)),
+            nn.Linear(self.global_state_dim, self.hypernet_hidden_dim),
             nn.ReLU(),
-            nn.Linear(int(hypernet_hidden_dim), 1),
+            nn.Linear(self.hypernet_hidden_dim, 1),
         )
 
     def forward(self, agent_qs: torch.Tensor, global_state: torch.Tensor) -> torch.Tensor:

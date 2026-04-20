@@ -14,8 +14,8 @@ This is a "block coordinate descent" style alternating optimization, different f
 alpha/eta ramp schedule used in `train_qmix_value_expansion.py`.
 
 Run from `UAV-Jammer-RL/`:
-  python -m Main.train_qmix_wm_alternating
-  python -m Main.train_qmix_wm_alternating --qmix-weights <...> --world-model-weights <...>
+  python -m Main.train.train_qmix_wm_alternating
+  python -m Main.train.train_qmix_wm_alternating --qmix-weights <...> --world-model-weights <...>
 """
 
 from __future__ import annotations

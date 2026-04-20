@@ -9,7 +9,7 @@ User request:
   - run 1500 episodes
 
 Run from `UAV-Jammer-RL/`:
-  python -m Main.train_qmix_value_expansion_fixed_wm --world-model-weights ./world_model_weights.pth
+  python -m Main.train.train_qmix_value_expansion_fixed_wm --world-model-weights ./world_model_weights.pth
 """
 
 from __future__ import annotations
