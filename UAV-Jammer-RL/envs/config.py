@@ -26,6 +26,7 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "t_Rx": 0.9,
     "t_collect": 0.5,
     "timestep": 0.2,
+    "max_episode_steps": 1000,
     "jammer_start": 0.2,
     "t_dwell": 2.28,
     "n_ch": 4,
@@ -59,18 +60,16 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "sensing_jammer_range": 250.0,
     "sensing_uav_range": 200.0,
     "is_jammer_moving": True,
-    "type_of_interference": "markov",
-    "step_forward": 1,
     "p_trans_mode": 1,
     # Fix Markov transition matrix generation across runs (for fair IQL vs QMIX comparison).
     "p_trans_seed": 0,
-    # Reactive bias (only for markov): >0 makes jammer prefer next-states overlapping with UAV used channels.
+    # Reactive bias: >0 makes jammer prefer next-states overlapping with observed UAV channels.
     "jammer_reactive_beta": 1.0,
-    # Hidden jammer mode (Dec-POMDP): jammer uses one of M Markov transition matrices and switches modes slowly.
-    # If `jammer_mode_seed` is None, a private seed is derived from the worker/global RNG state.
-    "jammer_modes": 3,
-    "jammer_mode_switch_prob": 0.02,
-    "jammer_mode_seed": None,
+    # Per-link probability that a reactive jammer observes each UAV channel choice.
+    # Values below 1.0 force partial observation, never a full oracle view.
+    "jammer_reactive_observe_prob": 0.5,
+    # Optional RNG seed for jammer state sampling and partial observation masks.
+    "jammer_seed": None,
     "reward_energy_weight": 1.0,
     "reward_jump_weight": 0.1,
     # Fairness (team penalty): if any cluster's success rate < threshold, penalize the whole team.

@@ -14,6 +14,7 @@ from envs.channels import UAVchannels, Jammerchannels
 from envs.config import load_env_config
 from envs.entities import UAV, Jammer, RP
 from envs.jammer_policy import (
+    JammerEvent,
     generate_p_trans as generate_jammer_p_trans,
     init_jammer_state,
     renew_jammer_channels_after_Rx as jammer_channels_after_Rx,
@@ -66,6 +67,9 @@ class Environ(gym.Env):
         self.t_collect = cfg["t_collect"]  # 收集数据
         self.timestep = cfg["timestep"]  # 频谱感知，选动作 + ACK + 学习
         self.timeslot = self.t_Rx + self.timestep  # 时隙
+        self.max_episode_steps = int(cfg.get("max_episode_steps", 1000))
+        if self.max_episode_steps <= 0:
+            raise ValueError(f"max_episode_steps must be positive, got {self.max_episode_steps}")
         self.t_uav = 0.00
         # self.t_uav = Decimal(self.t_uav).quantize(Decimal("0.00"))
         self.jammer_start = cfg["jammer_start"]  # 干扰机开始干扰时间
@@ -174,27 +178,19 @@ class Environ(gym.Env):
         self.max_distance2 = cfg["max_distance2"]
 
         self.is_jammer_moving = cfg["is_jammer_moving"]
-        self.type_of_interference = cfg["type_of_interference"]
-        self.step_forward = cfg["step_forward"]
         self.p_trans_mode = cfg["p_trans_mode"]
         self.p_trans_seed = int(cfg.get("p_trans_seed", 0))
         self.jammer_reactive_beta = float(cfg.get("jammer_reactive_beta", 0.0))
-        # Hidden jammer mode (Dec-POMDP): jammer uses one of M Markov transition matrices and switches modes slowly.
-        self.jammer_modes = int(cfg.get("jammer_modes", 1))
-        if int(self.jammer_modes) <= 0:
-            raise ValueError(f"jammer_modes must be positive, got {self.jammer_modes}")
-        self.jammer_mode_switch_prob = float(cfg.get("jammer_mode_switch_prob", 0.0))
-        if not (0.0 <= float(self.jammer_mode_switch_prob) <= 1.0):
+        self.jammer_reactive_observe_prob = float(cfg.get("jammer_reactive_observe_prob", 1.0))
+        if not (0.0 <= self.jammer_reactive_observe_prob <= 1.0):
             raise ValueError(
-                f"jammer_mode_switch_prob must be in [0,1], got {self.jammer_mode_switch_prob}"
+                "jammer_reactive_observe_prob must be in [0,1], got "
+                f"{self.jammer_reactive_observe_prob}"
             )
-        jammer_mode_seed = _resolve_local_seed(cfg.get("jammer_mode_seed", None))
-        self._jammer_mode_rng = np.random.default_rng(int(jammer_mode_seed))
-        # Jammer state sampling uses its own RNG as well so hidden-mode transitions
+        jammer_seed = _resolve_local_seed(cfg.get("jammer_seed", None))
+        # Jammer state sampling and partial observation use a private RNG so they
         # remain reproducible without depending on the process-global `random` state.
-        self._jammer_state_rng = random.Random(int(jammer_mode_seed))
-        self.jammer_mode = 0
-        self.p_trans_modes = None
+        self._jammer_state_rng = random.Random(int(jammer_seed))
         self.reward_energy_weight = cfg["reward_energy_weight"]
         self.reward_jump_weight = cfg["reward_jump_weight"]
         self.fairness_min_success_rate = float(cfg.get("fairness_min_success_rate", 0.0))
@@ -202,17 +198,12 @@ class Environ(gym.Env):
         self.csi_pathloss_offset = float(cfg.get("csi_pathloss_offset", 80.0))
         self.csi_pathloss_scale = float(cfg.get("csi_pathloss_scale", 60.0))
         self.csi_clip = bool(cfg.get("csi_clip", True))
-        # "markov"首先干扰机通过检测智能体的主要变化,
-        # 识别agent的工作模式并且建立工作模式状态转移的马尔可夫链,
-        # 然后利用合适的算法对建立的agent工作模式转移马尔可夫链计算转移概率,
-        # 最后将agent工作模式转移概率转化为矩阵形式就对agent下一个工作模式进行预测,
-        # 从而使得干扰机能够最大限度的对agent进行干扰
+        # Jammer behavior: Markov transition matrix plus optional reactive bias
+        # from partially observed UAV channel choices.
         self.policy = None  # 对应算法
         self.training = True
         self.jammer_channels = [0 for _ in range(self.n_jammer)]
-        self.jammer_channels_list = []
-        self.jammer_index_list = []
-        self.jammer_time = np.zeros([2], dtype=np.float32)
+        self.jammer_events = []
 
         self.uav_list = list(np.arange(self.n_uav))
         self.ch_list = random.sample(self.uav_list, k=self.n_ch)#由于随机数种子的原因，每次都选择2、7、3作为簇头
@@ -240,12 +231,12 @@ class Environ(gym.Env):
         ]
 
         #与奖励相关参数
-        self.uav_jump_count = np.zeros([self.n_ch], dtype=np.int32)
+        self.uav_jump_count = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
         self.rew_energy = 0
         self.rew_jump = 0
         self.rew_suc = 0
 
-        self.n_step = 0
+        self.episode_step = 0
 
         # 初始化观察状态和环境
         self.all_observed_states()
@@ -409,18 +400,15 @@ class Environ(gym.Env):
         # self.all_observed_states()
         self.t_uav = 0.0
         self.t_jammer = 0.0
+        self.episode_step = 0
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
         self.uav_channels = np.zeros([self.n_ch, self.n_des], dtype=np.int32)   # 每个智能体观察到的全局动作（假设智能体可以观察到其他智能体已经完成的动作）
         self.uav_powers = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
-        self.uav_jump_count = np.zeros([self.n_ch], dtype=np.int32)
+        self.uav_jump_count = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
         for i in range(self.n_ch):
             for j in range(self.n_des):
                 self.uav_channels[i][j] = random.randint(0, self.n_channel - 1)  #包括上下限
                 self.uav_powers[i][j] = random.uniform(self.uav_power_min, self.uav_power_max)  # dBm
-        if int(self.jammer_modes) > 1:
-            self.jammer_mode = int(self._jammer_mode_rng.integers(int(self.jammer_modes)))
-        else:
-            self.jammer_mode = 0
         init_jammer_state(self)
 
         # print("jammer_channels", self.jammer_channels)
@@ -549,76 +537,68 @@ class Environ(gym.Env):
 
     def compute_reward(self, i, j, other_channel_list, pairs):
         uav_uav_interference = 0.0   # interference from other UAV transmitters (linear mW)
-        jammer_interference_from_jammer0 = 0.0    #后半段干扰机干扰
-        jammer_interference_from_jammer1 = 0.0   #前半段干扰机干扰
 
         transmitter_idx = self.uav_pairs[i][j][0]
         receiver_idx = self.uav_pairs[i][j][1]
-        uav_signal = 10 ** ((self.uav_powers[i][j] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, self.uav_channels[i][j]] +
+        target_channel = int(self.uav_channels[i][j])
+        uav_signal = 10 ** ((self.uav_powers[i][j] - self.UAVchannels_loss_db[transmitter_idx, receiver_idx, target_channel] +
                              2 * self.uavAntGain - self.uavNoiseFigure) / 10)
         other_channel_arr = np.asarray(other_channel_list, dtype=np.int32)
-        if self.uav_channels[i][j] in other_channel_list:
-            index = np.where(other_channel_arr == self.uav_channels[i][j])
+        if target_channel in other_channel_list:
+            index = np.where(other_channel_arr == target_channel)
             for k in range(len(index[0])):
                 ii, jj = pairs[index[0][k]]
                 interferer_tx_idx = self.uav_pairs[ii][jj][0]
                 uav_uav_interference += 10 ** (
-                    (self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, self.uav_channels[i][j]]
+                    (self.uav_powers[ii][jj] - self.UAVchannels_loss_db[interferer_tx_idx, receiver_idx, target_channel]
                      + 2 * self.uavAntGain - self.uavNoiseFigure) / 10
                 )     #无人机内部干扰
 
-        jam_arr = np.asarray(self.jammer_channels_list, dtype=np.int32)
-        idx = np.where(jam_arr == self.uav_channels[i][j])[0]
-        if idx.size > 0:
-            time_eps = 1e-9
-            jammer_switched_during_rx = float(self.jammer_time[1]) > time_eps
-            if not jammer_switched_during_rx:     # 传输时间干扰机没换信道
-                jammer_interference = 0.0
-                for m in idx:
-                    jammer_idx = self.jammer_index_list[m]
+        events = [
+            event
+            for event in self.jammer_events
+            if int(event.channel) == target_channel and float(event.t_end) > float(event.t_start)
+        ]
+        boundaries = [0.0, float(self.t_Rx)]
+        for event in events:
+            boundaries.append(float(np.clip(event.t_start, 0.0, self.t_Rx)))
+            boundaries.append(float(np.clip(event.t_end, 0.0, self.t_Rx)))
+        boundaries = sorted(set(boundaries))
+
+        remaining_data = float(self.data_size)
+        transmit_time = float(self.t_Rx)
+        time_eps = 1e-9
+        interference_scale = float(max(0.0, self.uav_interference_scale))
+
+        for segment_start, segment_end in zip(boundaries[:-1], boundaries[1:]):
+            duration = float(segment_end - segment_start)
+            if duration <= time_eps:
+                continue
+
+            jammer_interference = 0.0
+            for event in events:
+                if float(event.t_start) <= segment_start + time_eps and float(event.t_end) >= segment_end - time_eps:
+                    jammer_idx = int(event.jammer_idx)
                     jammer_interference += 10 ** (
-                        (self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]]
-                         + self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10
+                        (
+                            self.jammer_power
+                            - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, target_channel]
+                            + self.jammerAntGain
+                            + self.uavAntGain
+                            - self.uavNoiseFigure
+                        )
+                        / 10
                     )
-                denom = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference) + float(self.sig2)
-                uav_rate = np.log2(1 + np.divide(uav_signal, denom))
-                uav_rate *= self.bandwidth
-                transmit_time = self.data_size / uav_rate
 
-
-            else:    # 传输时间干扰机换了信道，判断干扰了前半段还是后半段
-                for m in idx:
-                    jammer_idx = self.jammer_index_list[m]
-                    if m % 2 == 0:   # 后半段(self.jammer_channels_list先存入的后半段干扰信道序号）
-                        jammer_interference_from_jammer0 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
-                                                                 self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
-
-                denom0 = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference_from_jammer0) + float(self.sig2)
-                uav_rate = np.log2(1 + np.divide(uav_signal, denom0))
-                uav_rate *= self.bandwidth
-                transmit_time1 = self.data_size / uav_rate
-
-                for m in idx:
-                    jammer_idx = self.jammer_index_list[m]
-                    if m % 2 == 1:   # 前半段
-                        jammer_interference_from_jammer1 += 10 ** ((self.jammer_power - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, self.uav_channels[i][j]] +
-                                                                 self.jammerAntGain + self.uavAntGain - self.uavNoiseFigure) / 10)
-                denom1 = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(jammer_interference_from_jammer1) + float(self.sig2)
-                uav_rate = np.log2(1 + np.divide(uav_signal, denom1))
-                uav_rate *= self.bandwidth
-                transmit_time2 = self.data_size / uav_rate
-
-                if transmit_time2 > self.jammer_time[1]:
-                    transmit_time1 = (self.data_size - uav_rate * self.jammer_time[1]) / (self.data_size / transmit_time1)
-                    transmit_time = transmit_time1 + self.jammer_time[1]
-                else:
-                    transmit_time = transmit_time2
-
-        else:
-            denom = float(max(0.0, self.uav_interference_scale)) * float(uav_uav_interference) + float(self.sig2)
+            denom = interference_scale * float(uav_uav_interference) + float(jammer_interference) + float(self.sig2)
             uav_rate = np.log2(1 + np.divide(uav_signal, denom))
             uav_rate *= self.bandwidth
-            transmit_time = self.data_size / uav_rate
+            deliverable = float(uav_rate) * duration
+            if deliverable + time_eps >= remaining_data:
+                transmit_time = float(segment_start + remaining_data / float(uav_rate))
+                break
+            remaining_data -= deliverable
+
         suc = 0
         time = 0
         if transmit_time < self.t_Rx:
@@ -633,12 +613,11 @@ class Environ(gym.Env):
     def get_reward(self):
         uav_rewards = np.zeros([self.n_ch], dtype=float)
 
-        if self.jammer_channels_list == []:
-            for i in range(self.n_jammer):
-                self.jammer_channels_list.append(self.jammer_channels[i])
-                self.jammer_index_list.append(i)
-            self.jammer_time[0] = self.t_Rx
-            # print("jammer_channels", self.jammer_channels_list)
+        if not self.jammer_events:
+            self.jammer_events = [
+                JammerEvent(jammer_idx=i, channel=int(self.jammer_channels[i]), t_start=0.0, t_end=float(self.t_Rx))
+                for i in range(self.n_jammer)
+            ]
 
         tra = 0
         rec = 0
@@ -660,7 +639,7 @@ class Environ(gym.Env):
                 success_cnt[tra] += 1.0
             energy = 10 ** (self.uav_powers[tra][rec] / 10 - 3) * tra_time      # 能量奖励
             self.rew_energy += energy
-            jump = self.uav_jump_count[tra] # 跳频开销
+            jump = self.uav_jump_count[tra][rec] # 当前通信链路的跳频开销
             self.rew_jump += jump
             # uav_rewards[tra] += (0.5 * energy - 0.5 * jump)
             max_energy = 10 ** (self.uav_power_max / 10 - 3) * self.t_Rx + 1e-12
@@ -680,10 +659,8 @@ class Environ(gym.Env):
             team_penalty = float(self.fairness_weight) * float(np.mean(shortfall))
             uav_rewards -= team_penalty
 
-        self.jammer_channels_list = []
-        self.jammer_index_list = []
-        self.jammer_time = np.zeros([2])
-        self.uav_jump_count = np.zeros([self.n_ch], dtype=np.int32)
+        self.jammer_events = []
+        self.uav_jump_count = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
         return uav_rewards
 
     def reward_details(self):
@@ -996,7 +973,7 @@ class Environ(gym.Env):
                     self.uav_power_min + float(power_norm[j]) * (self.uav_power_max - self.uav_power_min)
                 )
                 if self.uav_channels[i][j] != channel_last:
-                    self.uav_jump_count[i] += 1
+                    self.uav_jump_count[i][j] += 1
                 decoded = int(decoded / self.n_channel)
 
     def generate_p_trans(self, mode = 1, rng=None):
@@ -1004,33 +981,14 @@ class Environ(gym.Env):
 
     def set_p(self, p_trans):
         p_arr = np.asarray(p_trans, dtype=np.float32)
-        if p_arr.ndim == 2:
-            self.p_trans = p_arr
-            if int(self.jammer_modes) <= 1:
-                self.p_trans_modes = None
-            else:
-                # Build per-mode transition matrices. Use the provided p_trans as mode 0,
-                # and generate the remaining matrices deterministically from `p_trans_seed`.
-                m = int(self.jammer_modes)
-                p_modes = np.zeros((m, int(self.jammer_state_dim), int(self.jammer_state_dim)), dtype=np.float32)
-                p_modes[0] = p_arr
-                for mode_idx in range(1, m):
-                    mode_rng = np.random.default_rng(int(self.p_trans_seed) + 10007 * mode_idx + 12345)
-                    p_modes[mode_idx] = np.asarray(
-                        generate_jammer_p_trans(self.jammer_state_dim, mode=int(self.p_trans_mode), rng=mode_rng),
-                        dtype=np.float32,
-                    )
-                self.p_trans_modes = p_modes
-        elif p_arr.ndim == 3:
-            if p_arr.shape[1] != int(self.jammer_state_dim) or p_arr.shape[2] != int(self.jammer_state_dim):
-                raise ValueError(
-                    "Invalid p_trans shape. Expected (M, D, D) with D=jammer_state_dim, got "
-                    f"{p_arr.shape} (D={self.jammer_state_dim})"
-                )
-            self.p_trans_modes = p_arr
-            self.p_trans = p_arr[0]
-        else:
-            raise ValueError(f"Invalid p_trans ndim={p_arr.ndim}. Expected 2 or 3 dims.")
+        if p_arr.ndim != 2:
+            raise ValueError(f"Invalid p_trans ndim={p_arr.ndim}. Expected a single 2-D Markov matrix.")
+        if p_arr.shape != (int(self.jammer_state_dim), int(self.jammer_state_dim)):
+            raise ValueError(
+                "Invalid p_trans shape. Expected (D, D) with D=jammer_state_dim, got "
+                f"{p_arr.shape} (D={self.jammer_state_dim})"
+            )
+        self.p_trans = p_arr
 
     def reset(self, p_trans):
         self.set_p(p_trans)
@@ -1046,7 +1004,16 @@ class Environ(gym.Env):
         reward = self.act()
         state_next = self.get_state()  # 得到新的状态
         self.renew_jammer_channels_after_learn()
-        return state_next, reward, False, {}
+        self.episode_step += 1
+        done = self.episode_step >= self.max_episode_steps
+        info = {
+            "episode_step": int(self.episode_step),
+            "max_episode_steps": int(self.max_episode_steps),
+        }
+        if done:
+            info["terminal_reason"] = "time_limit"
+            info["TimeLimit.truncated"] = True
+        return state_next, reward, done, info
 
     def smooth(self, data, sm=1):
         smooth_data = []
