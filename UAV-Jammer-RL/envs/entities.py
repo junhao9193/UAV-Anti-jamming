@@ -1,5 +1,3 @@
-from __future__ import division
-
 class UAV:
     def __init__(self, start_position, start_direction, start_velocity, start_p):
         self.position = start_position

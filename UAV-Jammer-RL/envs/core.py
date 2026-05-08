@@ -1,15 +1,9 @@
-from __future__ import division
-
 import math
 import random
 from copy import deepcopy
 
-try:
-    import gym
-    from gym import spaces
-except ModuleNotFoundError:  # gym is unmaintained; prefer gymnasium
-    import gymnasium as gym
-    from gymnasium import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 import numpy as np
 

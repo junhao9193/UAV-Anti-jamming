@@ -118,10 +118,7 @@ def train_qmix_value_expansion(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
@@ -520,5 +517,4 @@ if __name__ == "__main__":
         seed=int(args.seed),
     )
     print("Training completed!")
-
 

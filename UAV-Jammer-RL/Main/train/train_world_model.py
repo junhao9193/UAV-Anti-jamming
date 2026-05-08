@@ -176,10 +176,7 @@ def train_world_model(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
@@ -496,7 +493,6 @@ if __name__ == "__main__":
         start_method=str(args.start_method),
         save=(not bool(args.no_save)),
     )
-
 
 
 

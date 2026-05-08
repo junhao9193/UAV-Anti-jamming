@@ -1,5 +1,3 @@
-from __future__ import division
-
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -187,4 +185,3 @@ class MAPPOAgent:
 
 
 __all__ = ["MAPPOAgent", "ActResult"]
-

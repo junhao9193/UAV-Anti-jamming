@@ -1,21 +1,14 @@
-from __future__ import division
-
 import copy
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import amp as torch_amp
 
 from algorithms.mpdqn.agent import MPDQNAgent
 from algorithms.mpdqn.qmix.joint_replay_buffer import MPDQNJointReplayBuffer
 from algorithms.mpdqn.qplex.mixer import QPLEXMixer
-
-try:
-    from torch import amp as torch_amp
-except Exception:  # pragma: no cover - older torch
-    torch_amp = None
-
 
 class MPDQNQPLEXTrainer:
     """QPLEX-style cooperative MP-DQN trainer for hybrid discrete-continuous actions."""
@@ -61,10 +54,7 @@ class MPDQNQPLEXTrainer:
             self.device = torch.device(device)
 
         self.use_amp = bool(use_amp) and (self.device.type == "cuda")
-        if torch_amp is not None:
-            self.scaler = torch_amp.GradScaler("cuda", enabled=self.use_amp)
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch_amp.GradScaler("cuda", enabled=self.use_amp)
         self.max_grad_norm = float(max_grad_norm)
         self.value_target_clip = None if value_target_clip is None else float(value_target_clip)
 
@@ -155,11 +145,7 @@ class MPDQNQPLEXTrainer:
         next_global_state = next_state.reshape(next_state.shape[0], -1)
 
         def _autocast():
-            return (
-                torch_amp.autocast("cuda", enabled=self.use_amp)
-                if torch_amp is not None
-                else torch.cuda.amp.autocast(enabled=self.use_amp)
-            )
+            return torch_amp.autocast("cuda", enabled=self.use_amp)
 
         self.mixer_opt.zero_grad(set_to_none=True)
         for agent in self.agents:

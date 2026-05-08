@@ -1,5 +1,3 @@
-from __future__ import division
-
 from typing import Tuple
 
 import torch
@@ -66,4 +64,3 @@ class CentralValueNet(nn.Module):
 
 
 __all__ = ["HybridActor", "CentralValueNet"]
-

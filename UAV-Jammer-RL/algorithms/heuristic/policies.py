@@ -1,5 +1,3 @@
-from __future__ import division
-
 from dataclasses import dataclass
 from typing import Protocol
 

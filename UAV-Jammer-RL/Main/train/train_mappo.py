@@ -4,8 +4,6 @@ MAPPO training script (shared actor + centralized critic).
 Run from `UAV-Jammer-RL/`:
   python -m Main.train.train_mappo
 """
-from __future__ import division
-
 import argparse
 
 import numpy as np
@@ -38,10 +36,7 @@ def train_mappo(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True

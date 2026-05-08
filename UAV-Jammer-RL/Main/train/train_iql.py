@@ -2,8 +2,6 @@
 MP-DQN (IQL) 独立训练脚本
 每个 agent 独立学习，无全局协作
 """
-from __future__ import division
-
 import argparse
 
 import numpy as np
@@ -38,10 +36,7 @@ def train_mpdqn_iql(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True

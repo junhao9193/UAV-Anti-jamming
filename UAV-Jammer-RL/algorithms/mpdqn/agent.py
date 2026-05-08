@@ -1,5 +1,3 @@
-from __future__ import division
-
 import copy
 import random
 from typing import Optional, Tuple
@@ -7,15 +5,10 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import amp as torch_amp
 
 from algorithms.mpdqn.model import MPDQNActor, MPDQNQNetwork
 from algorithms.mpdqn.replay_buffer import MPDQNReplayBuffer
-
-try:
-    from torch import amp as torch_amp
-except Exception:  # pragma: no cover - older torch
-    torch_amp = None
-
 
 class MPDQNAgent:
     """
@@ -54,10 +47,7 @@ class MPDQNAgent:
             self.device = torch.device(device)
 
         self.use_amp = bool(use_amp) and (self.device.type == "cuda")
-        if torch_amp is not None:
-            self.scaler = torch_amp.GradScaler("cuda", enabled=self.use_amp)
-        else:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch_amp.GradScaler("cuda", enabled=self.use_amp)
         self.max_grad_norm = float(max_grad_norm)
 
         self.actor = MPDQNActor(self.state_dim, self.n_actions, self.param_dim).to(self.device)
@@ -201,11 +191,7 @@ class MPDQNAgent:
             raise ValueError(f"done must be (B,1), got {tuple(done.shape)}")
 
         def _autocast():
-            return (
-                torch_amp.autocast("cuda", enabled=self.use_amp)
-                if torch_amp is not None
-                else torch.cuda.amp.autocast(enabled=self.use_amp)
-            )
+            return torch_amp.autocast("cuda", enabled=self.use_amp)
 
         # --- Q update (Double DQN + MP-DQN multi-pass) ---
         self.q_opt.zero_grad(set_to_none=True)

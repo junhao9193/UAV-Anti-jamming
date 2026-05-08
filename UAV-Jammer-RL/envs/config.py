@@ -1,7 +1,7 @@
-from __future__ import division
-
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
+
+import yaml
 
 
 DEFAULT_ENV_CONFIG: Dict[str, Any] = {
@@ -96,14 +96,6 @@ def load_env_config(
     if config_path is not None:
         config_path = Path(config_path)
         if config_path.exists():
-            try:
-                import yaml
-            except ModuleNotFoundError:
-                yaml = None
-
-            if yaml is None:
-                raise ModuleNotFoundError("PyYAML is required to load YAML config files")
-
             loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             if not isinstance(loaded, dict):
                 raise ValueError("env config must be a mapping/dict")

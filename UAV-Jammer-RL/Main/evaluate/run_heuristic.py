@@ -5,8 +5,6 @@ Run from `UAV-Jammer-RL/`:
   python -m Main.evaluate.run_heuristic --policy greedy_sensing
   python -m Main.evaluate.run_heuristic --policy random --power-mode fixed_mid
 """
-from __future__ import division
-
 import argparse
 
 import numpy as np

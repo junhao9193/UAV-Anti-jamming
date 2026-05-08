@@ -2,8 +2,6 @@
 MP-DQN (QMIX) 联合训练脚本
 全局联合训练：team reward + joint replay + mixing network
 """
-from __future__ import division
-
 import argparse
 
 import numpy as np
@@ -39,10 +37,7 @@ def train_mpdqn_qmix(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True

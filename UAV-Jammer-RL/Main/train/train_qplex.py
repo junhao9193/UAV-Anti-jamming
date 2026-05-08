@@ -4,8 +4,6 @@ MP-DQN (QPLEX-style) cooperative training script.
 Run from `UAV-Jammer-RL/`:
   python -m Main.train.train_qplex
 """
-from __future__ import division
-
 import argparse
 
 import numpy as np
@@ -50,10 +48,7 @@ def train_mpdqn_qplex(
 
     def _configure_torch(dev: str) -> None:
         if dev.startswith("cuda"):
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
