@@ -42,8 +42,12 @@ class Environ(gym.Env):
             "BS_position",
             [self.length / 2, self.width / 2, (self.low_height + self.high_height) / 2],  # Suppose the BS is in the center
         )
-        self.k = cfg["k"]
-        self.sigma = cfg["sigma"]
+        self.k = float(cfg["k"])
+        if not (0.0 <= self.k <= 1.0):
+            raise ValueError(f"k must be in [0, 1] for the Gauss-Markov mobility model, got {self.k}")
+        self.sigma = float(cfg["sigma"])
+        if self.sigma < 0.0:
+            raise ValueError(f"sigma must be non-negative for the Gauss-Markov mobility model, got {self.sigma}")
 
         #无人机、干扰机各种参数
         uav_power_list = cfg.get("uav_power_list")
@@ -914,11 +918,11 @@ class Environ(gym.Env):
             self.jammers[i].position = [xpos, ypos, zpos]
 
             self.jammers[i].velocity = self.k * self.jammers[i].velocity + (1 - self.k) * np.average(
-                self.jammers[i].jammer_velocity) + (1 - self.k) ** 0.5 * np.random.normal(0, self.sigma)
+                self.jammers[i].jammer_velocity) + (1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
             self.jammers[i].direction = self.k * self.jammers[i].direction + (1 - self.k) * np.average(
-                self.jammers[i].jammer_direction) + (1 - self.k) ** 0.5 * np.random.normal(0, self.sigma)
+                self.jammers[i].jammer_direction) + (1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
             self.jammers[i].p = self.k * self.jammers[i].p + (1 - self.k) * np.average(self.jammers[i].jammer_p) + (
-                        1 - self.k) ** 0.5 * np.random.normal(0, self.sigma)
+                        1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
 
             self.jammers[i].jammer_velocity.append(self.jammers[i].velocity)
             self.jammers[i].jammer_direction.append(self.jammers[i].direction)
