@@ -1,5 +1,6 @@
 import math
 import random
+from collections import deque
 from copy import deepcopy
 
 import gymnasium as gym
@@ -17,6 +18,7 @@ from envs.jammer_policy import (
     JammerEvent,
     generate_p_trans as generate_jammer_p_trans,
     init_jammer_state,
+    record_jammer_observation,
     renew_jammer_channels_after_Rx as jammer_channels_after_Rx,
     renew_jammer_channels_after_learn as jammer_channels_after_learn,
 )
@@ -178,9 +180,24 @@ class Environ(gym.Env):
         self.max_distance2 = cfg["max_distance2"]
 
         self.is_jammer_moving = cfg["is_jammer_moving"]
-        self.p_trans_mode = cfg["p_trans_mode"]
         self.p_trans_seed = int(cfg.get("p_trans_seed", 0))
+        jammer_state_dim_local = int(perm(self.n_channel, self.n_jammer))
+        self.p_trans_preferred_next_states = int(cfg.get("p_trans_preferred_next_states", 2))
+        if not (0 <= self.p_trans_preferred_next_states <= jammer_state_dim_local):
+            raise ValueError(
+                "p_trans_preferred_next_states must be in [0, jammer_state_dim], got "
+                f"{self.p_trans_preferred_next_states}"
+            )
+        self.p_trans_preference_strength = float(cfg.get("p_trans_preference_strength", 0.5))
+        if self.p_trans_preference_strength < 0.0:
+            raise ValueError(
+                f"p_trans_preference_strength must be non-negative, got {self.p_trans_preference_strength}"
+            )
         self.jammer_reactive_beta = float(cfg.get("jammer_reactive_beta", 0.0))
+        self.jammer_memory_window = int(cfg.get("jammer_memory_window", 4))
+        if self.jammer_memory_window < 1:
+            raise ValueError(f"jammer_memory_window must be >= 1, got {self.jammer_memory_window}")
+        self._jammer_observed_channel_history = deque(maxlen=self.jammer_memory_window)
         self.jammer_reactive_observe_prob = float(cfg.get("jammer_reactive_observe_prob", 1.0))
         if not (0.0 <= self.jammer_reactive_observe_prob <= 1.0):
             raise ValueError(
@@ -197,6 +214,9 @@ class Environ(gym.Env):
         self.fairness_weight = float(cfg.get("fairness_weight", 0.0))
         self.csi_pathloss_offset = float(cfg.get("csi_pathloss_offset", 80.0))
         self.csi_pathloss_scale = float(cfg.get("csi_pathloss_scale", 60.0))
+        self.csi_noise_std = float(cfg.get("csi_noise_std", 0.0))
+        if self.csi_noise_std < 0.0:
+            raise ValueError(f"csi_noise_std must be non-negative, got {self.csi_noise_std}")
         self.csi_clip = bool(cfg.get("csi_clip", True))
         # Jammer behavior: Markov transition matrix plus optional reactive bias
         # from partially observed UAV channel choices.
@@ -240,7 +260,7 @@ class Environ(gym.Env):
 
         # 初始化观察状态和环境
         self.all_observed_states()
-        self.reset(self.generate_p_trans(mode=self.p_trans_mode))
+        self.reset(self.generate_p_trans())
         self.state_dim = len(self.get_state()[0])
         self.observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(self.state_dim,)) for _ in range(self.n_ch)]
 
@@ -401,6 +421,7 @@ class Environ(gym.Env):
         self.t_uav = 0.0
         self.t_jammer = 0.0
         self.episode_step = 0
+        self._jammer_observed_channel_history.clear()
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
         self.uav_channels = np.zeros([self.n_ch, self.n_des], dtype=np.int32)   # 每个智能体观察到的全局动作（假设智能体可以观察到其他智能体已经完成的动作）
         self.uav_powers = np.zeros([self.n_ch, self.n_des], dtype=np.float32)
@@ -467,6 +488,12 @@ class Environ(gym.Env):
                     rec_id = self.uav_pairs[i][j][1]        # 接收机
                     pathloss_vec = self.UAVchannels_loss_db[tra_id, rec_id, :].astype(np.float32)  # (n_channel,)
                     csi_ij = (pathloss_vec - self.csi_pathloss_offset) / self.csi_pathloss_scale
+                    if self.csi_noise_std > 0.0:
+                        csi_ij = csi_ij + np.random.normal(
+                            0.0,
+                            self.csi_noise_std,
+                            size=self.n_channel,
+                        ).astype(np.float32)
                     if self.csi_clip:
                         csi_ij = np.clip(csi_ij, -1.0, 1.0)
                     csi[i, j, :] = csi_ij
@@ -938,6 +965,7 @@ class Environ(gym.Env):
             self.Jammerchannels_loss_db = jammer_channels_loss_db
 
     def act(self):
+        record_jammer_observation(self)
         self.renew_jammer_channels_after_Rx()
         reward = self.get_reward()
         self.renew_positions_of_chs()
@@ -976,8 +1004,13 @@ class Environ(gym.Env):
                     self.uav_jump_count[i][j] += 1
                 decoded = int(decoded / self.n_channel)
 
-    def generate_p_trans(self, mode = 1, rng=None):
-        return generate_jammer_p_trans(self.jammer_state_dim, mode=mode, rng=rng)
+    def generate_p_trans(self, rng=None):
+        return generate_jammer_p_trans(
+            self.jammer_state_dim,
+            rng=rng,
+            preferred_next_states=self.p_trans_preferred_next_states,
+            preference_strength=self.p_trans_preference_strength,
+        )
 
     def set_p(self, p_trans):
         p_arr = np.asarray(p_trans, dtype=np.float32)
@@ -1009,6 +1042,10 @@ class Environ(gym.Env):
         info = {
             "episode_step": int(self.episode_step),
             "max_episode_steps": int(self.max_episode_steps),
+            "jammer_obs_history": [
+                sorted(int(ch) for ch in observed_set)
+                for observed_set in self._jammer_observed_channel_history
+            ],
         }
         if done:
             info["terminal_reason"] = "time_limit"

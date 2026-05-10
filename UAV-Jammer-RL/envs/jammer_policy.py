@@ -32,7 +32,7 @@ def _jammer_choices(env: Any, population, weights=None, k: int = 1):
     return rng.choices(population, weights=weights, k=k)
 
 
-def _observed_uav_channel_set(env: Any) -> set[int]:
+def _sample_observed_uav_channel_set(env: Any) -> set[int]:
     prob = float(getattr(env, "jammer_reactive_observe_prob", 1.0))
     if prob <= 0.0:
         return set()
@@ -49,18 +49,61 @@ def _observed_uav_channel_set(env: Any) -> set[int]:
     return {ch for ch in channels if float(rng.random()) < prob}
 
 
+def record_jammer_observation(env: Any) -> None:
+    """Push this step's partial UAV-channel observation into jammer memory.
+
+    Skip when reactive jamming is disabled or when memory is disabled
+    (window=1). The window=1 path samples directly inside the reactive row
+    calculation to preserve the legacy single-step behavior.
+    """
+    if float(getattr(env, "jammer_reactive_beta", 0.0)) <= 0.0:
+        return
+    if int(getattr(env, "jammer_memory_window", 4)) <= 1:
+        return
+
+    history = getattr(env, "_jammer_observed_channel_history", None)
+    if history is None:
+        return
+    history.append(_sample_observed_uav_channel_set(env))
+
+
+def _observed_uav_channel_frequencies(env: Any) -> dict[int, float]:
+    if int(getattr(env, "jammer_memory_window", 4)) <= 1:
+        observed_set = _sample_observed_uav_channel_set(env)
+        return {ch: 1.0 for ch in observed_set}
+
+    history = getattr(env, "_jammer_observed_channel_history", None)
+    if history is None:
+        observed_set = _sample_observed_uav_channel_set(env)
+        return {ch: 1.0 for ch in observed_set}
+
+    if len(history) == 0:
+        history.append(_sample_observed_uav_channel_set(env))
+
+    freq: dict[int, float] = {}
+    for observed_set in history:
+        for ch in observed_set:
+            freq[int(ch)] = freq.get(int(ch), 0.0) + 1.0
+
+    if not freq:
+        return {}
+
+    scale = 1.0 / float(len(history))
+    return {ch: count * scale for ch, count in freq.items()}
+
+
 def _reactive_transition_row(env: Any, idx: int) -> np.ndarray:
     p = np.asarray(env.p_trans[idx], dtype=np.float64)
     beta = float(getattr(env, "jammer_reactive_beta", 0.0))
     if beta <= 0.0:
         return p
 
-    observed_set = _observed_uav_channel_set(env)
-    if not observed_set:
+    observed_freq = _observed_uav_channel_frequencies(env)
+    if not observed_freq:
         return p
 
     scores = np.asarray(
-        [sum(1 for ch in state if ch in observed_set) for state in env.all_jammer_states_list],
+        [sum(observed_freq.get(int(ch), 0.0) for ch in state) for state in env.all_jammer_states_list],
         dtype=np.float64,
     )
     w = p * np.exp(beta * scores)
@@ -125,33 +168,29 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
         # print("change_channels", self.jammer_channels)
 
 
-def generate_p_trans(jammer_state_dim: int, mode: int = 1, rng: np.random.Generator | None = None) -> np.ndarray:
-    # 不使用uniform, 因为从统计上感觉很好学, 差异性不大
+def generate_p_trans(
+    jammer_state_dim: int,
+    rng: np.random.Generator | None = None,
+    preferred_next_states: int = 2,
+    preference_strength: float = 0.5,
+) -> np.ndarray:
     if rng is None:
         rng = np.random.default_rng()
-    p_trans = rng.uniform(0, 1, [jammer_state_dim, jammer_state_dim])  # 从[0,1)均匀分布随机取数
-    p_trans_sum = np.sum(p_trans, axis=1)  # 每一行的数相加得到列向量
-    if mode == 1:
-        for i in range(jammer_state_dim):
-            temp = rng.integers(low=0, high=jammer_state_dim)
-            p_trans[i][temp] += p_trans_sum[i] / 2
-            while rng.random() > 0.5:
-                temp = rng.integers(low=0, high=jammer_state_dim)
-                p_trans[i][temp] += p_trans_sum[i] / 3
-    elif mode == 2:
-        for i in range(jammer_state_dim):
-            while rng.random() > 0.7:
-                temp = rng.integers(low=0, high=jammer_state_dim)
-                p_trans[i][temp] += p_trans_sum[i] / 2
-    elif mode == 3:
-        pass
-    elif mode == 4:
-        for i in range(jammer_state_dim):
-            temp = rng.integers(low=0, high=jammer_state_dim)
-            p_trans[i][temp] += p_trans_sum[i]
+    p_trans = rng.uniform(0.0, 1.0, [jammer_state_dim, jammer_state_dim])
+    preferred_next_states = int(preferred_next_states)
+    preference_strength = float(preference_strength)
+    if preferred_next_states > 0 and preference_strength > 0.0:
+        preferred_next_states = min(preferred_next_states, jammer_state_dim)
+        p_trans_sum = np.sum(p_trans, axis=1)
+        preferred_idx = np.asarray(
+            [
+                rng.choice(jammer_state_dim, size=preferred_next_states, replace=False)
+                for _ in range(jammer_state_dim)
+            ],
+            dtype=np.int64,
+        )
+        row_idx = np.arange(jammer_state_dim, dtype=np.int64)[:, None]
+        np.add.at(p_trans, (row_idx, preferred_idx), p_trans_sum[:, None] * preference_strength)
 
-    p_trans_sum = np.sum(p_trans, axis=1)
-    for i in range(jammer_state_dim):
-        for j in range(jammer_state_dim):
-            p_trans[i][j] = p_trans[i][j] / p_trans_sum[i]  # 每行归一化
-    return p_trans
+    p_trans_sum = np.sum(p_trans, axis=1, keepdims=True)
+    return p_trans / p_trans_sum

@@ -60,9 +60,11 @@ def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
         "action_dim",
         "param_dim_per_action",
         "total_param_dim",
-        "p_trans_mode",
         "p_trans_seed",
+        "p_trans_preferred_next_states",
+        "p_trans_preference_strength",
         "jammer_reactive_beta",
+        "jammer_memory_window",
         "jammer_reactive_observe_prob",
         "uav_interference_scale",
         "reward_energy_weight",
@@ -71,6 +73,8 @@ def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
         "fairness_weight",
         "enable_fast_fading",
         "fast_fading_rho",
+        "csi_noise_std",
+        "sensing_noise_std",
     ]
     summary = {}
     for key in keys:
@@ -352,14 +356,13 @@ def make_fixed_p_trans(env) -> np.ndarray:
     """
     Create a fixed Markov transition matrix for jammer hopping.
 
-    - Uses `env.p_trans_seed` / `env.p_trans_mode` when present.
+    - Uses `env.p_trans_seed` when present.
     - Does NOT change global numpy RNG state for the rest of the program.
     """
-    mode = int(getattr(env, "p_trans_mode", 1))
     seed = int(getattr(env, "p_trans_seed", 0))
 
     rng = np.random.default_rng(seed)
-    p_trans = env.generate_p_trans(mode=mode, rng=rng)
+    p_trans = env.generate_p_trans(rng=rng)
     return np.asarray(p_trans, dtype=np.float32)
 
 def _env_worker(remote, parent_remote, config_path: Optional[str], p_trans: Optional[np.ndarray], worker_seed: Optional[int] = None) -> None:

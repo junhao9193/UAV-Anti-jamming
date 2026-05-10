@@ -60,11 +60,18 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "sensing_jammer_range": 250.0,
     "sensing_uav_range": 200.0,
     "is_jammer_moving": True,
-    "p_trans_mode": 1,
     # Fix Markov transition matrix generation across runs (for fair IQL vs QMIX comparison).
     "p_trans_seed": 0,
+    # Markov base preference: each row gets this many preferred next joint states.
+    "p_trans_preferred_next_states": 2,
+    # Added weight per preferred next joint state, as a multiple of that row's pre-normalization sum.
+    "p_trans_preference_strength": 0.5,
     # Reactive bias: >0 makes jammer prefer next-states overlapping with observed UAV channels.
+    # 0.0 keeps only the Markov base preferences.
     "jammer_reactive_beta": 1.0,
+    # Number of recent partially observed UAV-channel sets used by the reactive jammer.
+    # 1 preserves instantaneous reactive behavior; 4 is the default memoryful jammer.
+    "jammer_memory_window": 4,
     # Per-link probability that a reactive jammer observes each UAV channel choice.
     # Values below 1.0 force partial observation, never a full oracle view.
     "jammer_reactive_observe_prob": 0.5,
@@ -77,6 +84,8 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "fairness_weight": 1.0,
     "csi_pathloss_offset": 80.0,
     "csi_pathloss_scale": 60.0,
+    # Gaussian observation noise added after CSI normalization.
+    "csi_noise_std": 0.05,
     "csi_clip": True,
 }
 
