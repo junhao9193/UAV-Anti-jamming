@@ -1,5 +1,5 @@
 """
-Alternating training loop: QMIX (with Value Expansion) <-> Value-Consistent RSSM World Model.
+Alternating training loop: QMIX Value Expansion <-> Value-Consistent RSSM World Model.
 
 Supports two modes:
   - From scratch (default): initialize QMIX + RSSM randomly, then alternate training blocks
@@ -315,9 +315,9 @@ def train_qmix_wm_alternating(
         raise ValueError("qmix_block_episodes + wm_block_episodes must be positive")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    algorithm = "mpdqn_qmix_wm_alternating"
+    algorithm = "mpdqn_qmix_wm_alternating_ve"
 
-    pbar = trange(int(total_episodes), desc="Training(QMIX<->WM)", unit="ep", ascii=True)
+    pbar = trange(int(total_episodes), desc="Training(QMIX<->WM-alternating-VE)", unit="ep", ascii=True)
     try:
         for ep in pbar:
             pos_in_block = int(ep) % int(block_len)
@@ -499,7 +499,7 @@ def train_qmix_wm_alternating(
         n_steps=int(n_steps),
         trainer=qmix,
         run_config={
-            "algorithm": "mpdqn_qmix_wm_alternating",
+            "algorithm": algorithm,
             "seed": int(seed),
             "num_envs": int(num_envs),
             "batch_size": int(batch_size),
@@ -622,7 +622,7 @@ def train_qmix_wm_alternating(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Alternating QMIX<->WorldModel training (from scratch or resume)")
+    parser = argparse.ArgumentParser(description="Train QMIX + World Model with alternating Value Expansion blocks")
     parser.add_argument("--qmix-weights", type=str, default=None, help="Optional QMIX checkpoint to resume from")
     parser.add_argument(
         "--world-model-weights",

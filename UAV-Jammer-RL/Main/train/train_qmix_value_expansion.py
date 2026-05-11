@@ -1,7 +1,7 @@
 """
-MP-DQN (QMIX) + Value Expansion with a Value-Consistent RSSM World Model.
+MP-DQN (QMIX) + World Model Value Expansion with joint training.
 
-Implements the alternating loop described in `doc/价值一致性世界模型.md`:
+Implements the joint QMIX/World-Model loop described in `doc/价值一致性世界模型.md`:
   Step 0: collect real data with QMIX behavior policy (epsilon-greedy)
   Step 1: update critic with mixed target y = (1-α) y_real + α y_model
   Step 2: periodic target network update (handled inside QMIX trainer)
@@ -235,7 +235,7 @@ def train_qmix_value_expansion(
     alpha_history = []
     eta_history = []
 
-    pbar = trange(n_episode, desc="Training(QMIX+WMVE-RSSM)", unit="ep", ascii=True)
+    pbar = trange(n_episode, desc="Training(QMIX+WM-joint-VE)", unit="ep", ascii=True)
     try:
         for episode in pbar:
             # Training phases (3-phase curriculum):
@@ -415,8 +415,9 @@ def train_qmix_value_expansion(
     }
 
     if save_data:
+        algorithm = "mpdqn_qmix_wm_joint_ve"
         _, _, out_dir = save_training_data(
-            algorithm="mpdqn_qmix_wmve_rssm",
+            algorithm=algorithm,
             reward_history=reward_history,
             success_rate_history=success_rate_history,
             energy_history=energy_history,
@@ -425,7 +426,7 @@ def train_qmix_value_expansion(
             n_steps=n_steps,
             trainer=qmix,
             run_config={
-                "algorithm": "mpdqn_qmix_wmve_rssm",
+                "algorithm": algorithm,
                 "seed": int(seed),
                 "num_envs": int(num_envs),
                 "batch_size": int(batch_size),
@@ -480,7 +481,7 @@ def train_qmix_value_expansion(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train QMIX + RSSM World Model Value Expansion")
+    parser = argparse.ArgumentParser(description="Train QMIX + World Model with joint Value Expansion")
 
     parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
@@ -525,7 +526,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 60)
-    print("Starting QMIX + World Model Value Expansion Training (RSSM)")
+    print("Starting QMIX + World Model Joint Value Expansion Training")
     print("=" * 60)
 
     train_qmix_value_expansion(
