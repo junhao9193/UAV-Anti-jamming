@@ -61,6 +61,10 @@ def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
         "param_dim_per_action",
         "total_param_dim",
         "env_seed",
+        "data_size",
+        "t_Rx",
+        "jammer_power",
+        "max_episode_steps",
         "p_trans_seed",
         "p_trans_preferred_next_states",
         "p_trans_preference_strength",
@@ -91,10 +95,23 @@ def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
     }
 
 
-def validate_positive_run_args(*, n_episode: int, n_steps: int, num_envs: int) -> None:
+def resolve_episode_steps(env: Any, n_steps: Optional[int] = None) -> int:
+    """Use env.max_episode_steps when callers do not explicitly cap rollout length."""
+    if n_steps is None:
+        n_steps = getattr(env, "max_episode_steps", None)
+        if n_steps is None:
+            raise ValueError("n_steps was not provided and env.max_episode_steps is unavailable")
+
+    n_steps = int(n_steps)
+    if n_steps <= 0:
+        raise ValueError(f"n_steps/steps must be positive, got {n_steps}")
+    return n_steps
+
+
+def validate_positive_run_args(*, n_episode: int, n_steps: Optional[int], num_envs: int) -> None:
     if int(n_episode) <= 0:
         raise ValueError(f"n_episode/episodes must be positive, got {n_episode}")
-    if int(n_steps) <= 0:
+    if n_steps is not None and int(n_steps) <= 0:
         raise ValueError(f"n_steps/steps must be positive, got {n_steps}")
     if int(num_envs) <= 0:
         raise ValueError(f"num_envs must be positive, got {num_envs}")
@@ -504,6 +521,7 @@ __all__ = [
     "get_repo_root",
     "get_project_root",
     "resolve_env_config_path",
+    "resolve_episode_steps",
     "env_run_config",
     "validate_positive_run_args",
     "make_unique_output_dir",

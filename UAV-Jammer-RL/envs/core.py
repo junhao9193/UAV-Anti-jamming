@@ -42,8 +42,8 @@ class Environ:
         def _seed_int_from_sequence(seed_seq):
             return int(seed_seq.generate_state(1, dtype=np.uint32)[0])
 
-        self.length = cfg["length"]  # 1000
-        self.width = cfg["width"]  # 500
+        self.length = cfg["length"]
+        self.width = cfg["width"]
         self.low_height = cfg["low_height"]
         self.high_height = cfg["high_height"]
         self.BS_position = cfg.get(
@@ -100,7 +100,7 @@ class Environ:
         self.n_rp_cm = self.n_cm
         self.n_rp = self.n_uav  # 簇成员的参考节点个数
         self.n_des = self.n_cm_for_a_ch  # 每个ch的通信目标数
-        self.n_uav_pair = self.n_ch * self.n_des  # 一共6个通信对
+        self.n_uav_pair = self.n_ch * self.n_des  # total communication links
         self.n_jammer = cfg["n_jammer"]  # number of jammers
         self.n_channel = cfg["n_channel"]  # int(self.n_ch+self.n_jammer-1)  # number of channels
         self.channel_indexes = np.arange(self.n_channel)

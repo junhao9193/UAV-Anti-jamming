@@ -29,7 +29,7 @@ import numpy as np
 from tqdm.auto import trange
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, save_training_data
+from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, resolve_episode_steps, save_training_data
 
 
 def _linear_ramp(t: int, *, t0: int, t1: int, v_max: float) -> float:
@@ -104,7 +104,7 @@ def train_qmix_wm_alternating(
     total_episodes: int = 500,
     qmix_block_episodes: int = 50,
     wm_block_episodes: int = 50,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     num_envs: int = 32,
     # QMIX hyper-params
     batch_size: int = 256,
@@ -163,6 +163,7 @@ def train_qmix_wm_alternating(
     torch.manual_seed(int(seed))
 
     env0 = Environ()
+    n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method), seed=int(seed))
 
@@ -338,6 +339,7 @@ def train_qmix_wm_alternating(
             global_states = states.reshape(int(num_envs), -1).astype(np.float32)
 
             episode_reward = 0.0
+            steps_done = 0
             q_loss_q_sum = 0.0
             q_loss_count = 0
             wm_loss_sum = 0.0
@@ -431,9 +433,13 @@ def train_qmix_wm_alternating(
                 states = next_states
                 global_states = next_global_states
                 episode_reward += float(np.mean(rewards))
+                steps_done += 1
+                if bool(np.any(dones)):
+                    break
 
             # Episode metrics
-            total_links = float(int(n_steps) * int(num_envs) * int(n_agents) * int(env0.n_des))
+            steps_done = max(1, int(steps_done))
+            total_links = float(steps_done * int(num_envs) * int(n_agents) * int(env0.n_des))
             energy_arr, jump_arr, suc_arr = vecenv.get_metrics()
             avg_energy = float(np.sum(energy_arr) / (total_links + 1e-12))
             avg_jump = float(np.sum(jump_arr) / (total_links + 1e-12))
@@ -573,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--qmix-block", type=int, default=50)
     parser.add_argument("--wm-block", type=int, default=50)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--buffer-capacity", type=int, default=200_000)
@@ -622,7 +628,7 @@ if __name__ == "__main__":
         total_episodes=int(args.episodes),
         qmix_block_episodes=int(args.qmix_block),
         wm_block_episodes=int(args.wm_block),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         num_envs=int(args.num_envs),
         batch_size=int(args.batch_size),
         buffer_capacity=int(args.buffer_capacity),
@@ -660,4 +666,3 @@ if __name__ == "__main__":
         save_data=not bool(args.no_save),
         seed=int(args.seed),
     )
-

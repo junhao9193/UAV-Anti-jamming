@@ -23,7 +23,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, save_training_data
+from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, resolve_episode_steps, save_training_data
 from tqdm.auto import trange
 
 
@@ -68,7 +68,7 @@ def _save_world_model_checkpoint(
 def train_qmix_value_expansion(
     *,
     n_episode: int = 3000,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     num_envs: int = 32,
     batch_size: int = 256,
     buffer_capacity: int = 200_000,
@@ -127,6 +127,7 @@ def train_qmix_value_expansion(
         raise ValueError("seq_len must be positive")
 
     env0 = Environ()
+    n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(
         int(num_envs),
@@ -255,6 +256,7 @@ def train_qmix_value_expansion(
             global_states = states.reshape(n_envs, -1).astype(np.float32)
 
             episode_reward = 0.0
+            steps_done = 0
             loss_q_sum = 0.0
             loss_actor_sum = 0.0
             loss_count = 0
@@ -352,9 +354,13 @@ def train_qmix_value_expansion(
                 states = next_states
                 global_states = next_global_states
                 episode_reward += float(np.mean(rewards))
+                steps_done += 1
+                if bool(np.any(dones)):
+                    break
 
             # Episode metrics
-            total_links = float(int(n_steps) * n_envs * n_agents * int(env0.n_des))
+            steps_done = max(1, int(steps_done))
+            total_links = float(steps_done * n_envs * n_agents * int(env0.n_des))
             energy_arr, jump_arr, suc_arr = vecenv.get_metrics()
             avg_energy = float(np.sum(energy_arr) / (total_links + 1e-12))
             avg_jump = float(np.sum(jump_arr) / (total_links + 1e-12))
@@ -433,7 +439,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train QMIX + RSSM World Model Value Expansion")
 
     parser.add_argument("--episodes", type=int, default=3000)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--buffer-capacity", type=int, default=200_000)
@@ -480,7 +486,7 @@ if __name__ == "__main__":
 
     train_qmix_value_expansion(
         n_episode=int(args.episodes),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         num_envs=int(args.num_envs),
         batch_size=int(args.batch_size),
         buffer_capacity=int(args.buffer_capacity),
@@ -517,4 +523,3 @@ if __name__ == "__main__":
         seed=int(args.seed),
     )
     print("Training completed!")
-

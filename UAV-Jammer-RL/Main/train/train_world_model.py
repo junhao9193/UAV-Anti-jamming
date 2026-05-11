@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, make_unique_output_dir
+from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, make_unique_output_dir, resolve_episode_steps
 from tqdm.auto import trange
 
 
@@ -138,7 +138,7 @@ def _save_world_model_artifacts(
 def train_world_model(
     *,
     n_episode: int = 1500,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     num_envs: int = 32,
     batch_size: int = 512,
     buffer_capacity: int = 500_000,
@@ -185,6 +185,7 @@ def train_world_model(
         raise ValueError("seq_len must be positive")
 
     env0 = Environ()
+    n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(
         int(num_envs),
@@ -352,6 +353,8 @@ def train_world_model(
 
                 states = next_states
                 global_states = next_global_states
+                if bool(np.any(dones)):
+                    break
 
             loss_count = max(1, int(loss_count))
             loss_hist["loss_state"].append(loss_state_sum / loss_count)
@@ -429,7 +432,7 @@ def train_world_model(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Joint World Model (RSSM)")
     parser.add_argument("--episodes", type=int, default=1500)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--buffer-capacity", type=int, default=500_000)
@@ -465,7 +468,7 @@ if __name__ == "__main__":
 
     train_world_model(
         n_episode=int(args.episodes),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         num_envs=int(args.num_envs),
         batch_size=int(args.batch_size),
         buffer_capacity=int(args.buffer_capacity),
@@ -493,6 +496,5 @@ if __name__ == "__main__":
         start_method=str(args.start_method),
         save=(not bool(args.no_save)),
     )
-
 
 

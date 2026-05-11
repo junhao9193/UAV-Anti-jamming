@@ -22,6 +22,7 @@ from Main.common import (
     env_run_config,
     make_fixed_p_trans,
     resolve_env_config_path,
+    resolve_episode_steps,
     save_training_data,
     validate_positive_run_args,
 )
@@ -82,7 +83,7 @@ def evaluate_policy(
     power_mode: str = "quality_adaptive",
     algorithm_name: str | None = None,
     n_episode: int = 100,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     num_envs: int = 32,
     device: str | None = None,
     save_data: bool = True,
@@ -112,6 +113,7 @@ def evaluate_policy(
     torch.manual_seed(int(seed))
 
     env0 = Environ(config_path=config_path)
+    n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
 
     ckpt: dict[str, Any] | None = None
@@ -182,6 +184,8 @@ def evaluate_policy(
                 states = next_states
                 episode_reward += float(np.mean(rewards))
                 steps_done += 1
+                if bool(np.any(dones)):
+                    break
 
             steps_done = max(1, int(steps_done))
             total_links = float(steps_done * n_envs * n_agents * int(env0.n_des))
@@ -252,7 +256,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heuristic-policy", type=str, default="greedy_sensing", choices=["random", "greedy_sensing", "max_csi", "min_interference"])
     parser.add_argument("--power-mode", type=str, default="quality_adaptive", choices=["quality_adaptive", "fixed_mid", "fixed_low", "random"])
     parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
@@ -271,7 +275,7 @@ def main() -> None:
         power_mode=str(args.power_mode),
         algorithm_name=args.algorithm_name,
         n_episode=int(args.episodes),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         num_envs=int(args.num_envs),
         device=args.device,
         save_data=not bool(args.no_save),

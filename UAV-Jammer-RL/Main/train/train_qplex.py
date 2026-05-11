@@ -14,6 +14,7 @@ from Main.common import (
     env_run_config,
     make_fixed_p_trans,
     resolve_env_config_path,
+    resolve_episode_steps,
     save_training_data,
     validate_positive_run_args,
 )
@@ -22,7 +23,7 @@ from tqdm.auto import trange
 
 def train_mpdqn_qplex(
     n_episode: int = 1500,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     num_envs: int = 32,
     batch_size: int = 256,
     buffer_capacity: int = 200_000,
@@ -65,6 +66,7 @@ def train_mpdqn_qplex(
     torch.manual_seed(int(seed))
 
     env0 = Environ(config_path=config_path)
+    n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(
         int(num_envs),
@@ -161,6 +163,8 @@ def train_mpdqn_qplex(
                 states = next_states
                 episode_reward += float(np.mean(rewards))
                 steps_done += 1
+                if bool(np.any(dones)):
+                    break
 
             steps_done = max(1, int(steps_done))
             total_links = float(steps_done * n_envs * n_agents * int(env0.n_des))
@@ -247,7 +251,7 @@ def train_mpdqn_qplex(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MP-DQN (QPLEX-style)")
     parser.add_argument("--episodes", type=int, default=1500)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--buffer-capacity", type=int, default=200_000)
@@ -273,7 +277,7 @@ if __name__ == "__main__":
     print("=" * 60)
     train_mpdqn_qplex(
         n_episode=int(args.episodes),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         num_envs=int(args.num_envs),
         batch_size=int(args.batch_size),
         buffer_capacity=int(args.buffer_capacity),

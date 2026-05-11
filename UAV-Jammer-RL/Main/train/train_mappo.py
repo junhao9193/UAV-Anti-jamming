@@ -9,13 +9,13 @@ import argparse
 import numpy as np
 
 from envs import Environ
-from Main.common import make_fixed_p_trans, save_training_data
+from Main.common import make_fixed_p_trans, resolve_episode_steps, save_training_data
 from tqdm.auto import trange
 
 
 def train_mappo(
     n_episode: int = 1500,
-    n_steps: int = 1000,
+    n_steps: int | None = None,
     lr: float = 3e-4,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
@@ -49,6 +49,7 @@ def train_mappo(
     torch.manual_seed(int(seed))
 
     env = Environ(config={"env_seed": int(seed)})
+    n_steps = resolve_episode_steps(env, n_steps)
     p_trans_fixed = make_fixed_p_trans(env)
     env.set_p(p_trans_fixed)
 
@@ -195,7 +196,7 @@ def train_mappo(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MAPPO")
     parser.add_argument("--episodes", type=int, default=1500)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
     parser.add_argument(
         "--rollout-steps",
         dest="steps",
@@ -221,7 +222,7 @@ if __name__ == "__main__":
     print("=" * 60)
     train_mappo(
         n_episode=int(args.episodes),
-        n_steps=int(args.steps),
+        n_steps=args.steps,
         lr=float(args.lr),
         gamma=float(args.gamma),
         gae_lambda=float(args.gae_lambda),

@@ -123,7 +123,7 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
     prev_dwell = _dwell_index(env.t_jammer - env.t_Rx, env.t_dwell)
     curr_dwell = _dwell_index(env.t_jammer, env.t_dwell)
     if prev_dwell == curr_dwell - 1:
-        # （干扰机时间-传输时间0.98）/干扰机扫频停留时间2.28 == 干扰机时间/干扰机扫频停留时间 - 1
+        # Detect whether the Rx interval crossed exactly one jammer dwell boundary.
         old_jammer_channels = tuple(env.jammer_channels)
         idx = env.all_jammer_states_list.index(old_jammer_channels)
         p = _reactive_transition_row(env, idx)
