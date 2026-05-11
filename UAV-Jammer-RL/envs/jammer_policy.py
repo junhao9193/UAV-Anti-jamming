@@ -1,4 +1,3 @@
-import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +27,7 @@ def _at_dwell_boundary(t: float, dwell: float) -> bool:
 def _jammer_choices(env: Any, population, weights=None, k: int = 1):
     rng = getattr(env, "_jammer_state_rng", None)
     if rng is None:
-        return random.choices(population, weights=weights, k=k)
+        raise RuntimeError("Reactive jammer requires env._jammer_state_rng; initialize Environ first.")
     return rng.choices(population, weights=weights, k=k)
 
 
@@ -44,7 +43,7 @@ def _sample_observed_uav_channel_set(env: Any) -> set[int]:
 
     rng = getattr(env, "_jammer_state_rng", None)
     if rng is None:
-        rng = random
+        raise RuntimeError("Reactive jammer requires env._jammer_state_rng; initialize Environ first.")
 
     return {ch for ch in channels if float(rng.random()) < prob}
 

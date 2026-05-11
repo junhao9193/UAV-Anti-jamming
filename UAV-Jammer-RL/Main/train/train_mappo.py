@@ -48,7 +48,7 @@ def train_mappo(
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
 
-    env = Environ()
+    env = Environ(config={"env_seed": int(seed)})
     p_trans_fixed = make_fixed_p_trans(env)
     env.set_p(p_trans_fixed)
 

@@ -9,8 +9,12 @@ DEFAULT_ENV_CONFIG: Dict[str, Any] = {
     "width": 250,
     "low_height": 60,
     "high_height": 120,
+    # Optional root seed for environment-private RNG streams. When set, the
+    # environment trajectory is reproducible without relying on global RNG state.
+    "env_seed": None,
     # Gauss-Markov mobility model used by both UAVs and jammers:
-    # x_t = k*x_{t-1} + (1-k)*mean(history) + sqrt(1-k^2)*N(0, sigma).
+    # x_t = k*x_{t-1} + (1-k)*x_mean + sqrt(1-k^2)*N(0, sigma).
+    # x_mean is the fixed target motion value sampled when the entity is created.
     # Larger k means smoother, more inertial motion; larger sigma means stronger random perturbations.
     "k": 0.8,
     "sigma": 0.2,

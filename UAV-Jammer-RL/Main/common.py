@@ -60,6 +60,7 @@ def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
         "action_dim",
         "param_dim_per_action",
         "total_param_dim",
+        "env_seed",
         "p_trans_seed",
         "p_trans_preferred_next_states",
         "p_trans_preference_strength",
@@ -384,12 +385,13 @@ def _env_worker(remote, parent_remote, config_path: Optional[str], p_trans: Opti
         import random as _random
         from envs import Environ
 
-        # Seed per-worker random sources for reproducibility.
+        # Seed legacy/global sources for any code outside the env-private RNG path.
         if worker_seed is not None:
             _random.seed(int(worker_seed))
             np.random.seed(int(worker_seed) % (2**31))
 
-        env = Environ(config_path=config_path) if config_path else Environ()
+        env_config = {"env_seed": int(worker_seed)} if worker_seed is not None else None
+        env = Environ(config=env_config, config_path=config_path) if config_path else Environ(config=env_config)
         if p_trans is not None:
             env.set_p(p_trans)
 

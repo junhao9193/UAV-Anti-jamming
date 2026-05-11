@@ -1,57 +1,55 @@
 import numpy as np
 
+
+def _position_array(positions):
+    arr = np.asarray(positions, dtype=np.float64)
+    if arr.size == 0:
+        return arr.reshape(0, 3)
+    return arr.reshape(-1, 3)
+
+
+def pathloss_matrix(tx_positions, rx_positions):
+    tx = _position_array(tx_positions)
+    rx = _position_array(rx_positions)
+    diff = tx[:, np.newaxis, :] - rx[np.newaxis, :, :]
+    distance = np.linalg.norm(diff, axis=-1) + 0.001
+    return 103.8 + 20.9 * np.log10(distance * 1e-3)
+
+
+def pathloss_between(position_A, position_B):
+    return float(pathloss_matrix([position_A], [position_B])[0, 0])
+
+
 class UAVchannels:
     def __init__(self, n_uav, n_channel, BS_position):
-        self.h_bs = 25  # BS antenna height
-        self.h_uav = 1.5  # uav antenna height
-        self.fc = 2  # 载频2GHz
-        self.BS_position = BS_position
+        del n_channel, BS_position
+        # Current pathloss model depends only on 3D transmitter-receiver distance.
         self.n_uav = n_uav
-        self.n_channel = n_channel
 
     def update_positions(self, positions):
         self.positions = positions
 
     def update_pathloss(self):
-        self.PathLoss = np.zeros(shape=(len(self.positions), len(self.positions)))
-        for i in range(len(self.positions)):
-            for j in range(len(self.positions)):
-                self.PathLoss[i][j] = self.get_path_loss(self.positions[i], self.positions[j])
+        self.PathLoss = pathloss_matrix(self.positions, self.positions)
 
     #无人机之间的位置路径损耗
     def get_path_loss(self, position_A, position_B):
-        d1 = abs(position_A[0] - position_B[0])
-        d2 = abs(position_A[1] - position_B[1])
-        d3 = abs(position_A[2] - position_B[2])
-        distance = np.sqrt(d1**2 + d2**2 + d3**2) + 0.001
-        PL_los = 103.8 + 20.9*np.log10(distance*1e-3)
-        return PL_los
+        return pathloss_between(position_A, position_B)
 
 class Jammerchannels:
     def __init__(self, n_jammer, n_uav, n_channel, BS_position):
-        self.h_bs = 25  # BS antenna height
-        self.h_jammer = 1.5  # jammer antenna height
-        self.h_uav = 1.5  # uav antenna height
-        self.BS_position = BS_position
+        del n_channel, BS_position
+        # Current pathloss model depends only on 3D transmitter-receiver distance.
         self.n_jammer = n_jammer
         self.n_uav = n_uav
-        self.n_channel = n_channel
 
     def update_positions(self, positions, uav_positions):
         self.positions = positions
         self.uav_positions = uav_positions
 
     def update_pathloss(self):
-        self.PathLoss = np.zeros(shape=(len(self.positions), len(self.uav_positions)))
-        for i in range(len(self.positions)):
-            for j in range(len(self.uav_positions)):
-                self.PathLoss[i][j] = self.get_path_loss(self.positions[i], self.uav_positions[j])
+        self.PathLoss = pathloss_matrix(self.positions, self.uav_positions)
 
     #position A表示干扰机的位置 position B表示无人机的位置
     def get_path_loss(self, position_A, position_B):
-        d1 = abs(position_A[0] - position_B[0])
-        d2 = abs(position_A[1] - position_B[1])
-        d3 = abs(position_A[2] - position_B[2])
-        distance = np.sqrt(d1**2 + d2**2 + d3**2) + 0.001
-        PL_los = 103.8 + 20.9*np.log10(distance*1e-3)
-        return PL_los
+        return pathloss_between(position_A, position_B)

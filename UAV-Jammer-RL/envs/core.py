@@ -3,7 +3,6 @@ import random
 from collections import deque
 from copy import deepcopy
 
-import gymnasium as gym
 from gymnasium import spaces
 
 import numpy as np
@@ -23,16 +22,25 @@ from envs.jammer_policy import (
     renew_jammer_channels_after_learn as jammer_channels_after_learn,
 )
 
-class Environ(gym.Env):
+class Environ:
+    """Project-specific multi-agent environment.
+
+    This class intentionally keeps the repository's legacy multi-agent API:
+    `reset(p_trans=None) -> state` and `step(actions) -> (state, reward, done, info)`.
+    It does not inherit from `gymnasium.Env` because its spaces are per-agent
+    lists and its reset/step signatures are not the Gymnasium single-agent API.
+    """
+
     def __init__(self, config=None, config_path=None):
         cfg = load_env_config(config=config, config_path=config_path)
 
-        def _resolve_local_seed(explicit_seed):
-            if explicit_seed is not None:
-                return int(explicit_seed)
-            # Derive child RNG seeds from the current global numpy RNG state so
-            # worker-side `np.random.seed(...)` propagates into private RNG streams.
-            return int(np.random.randint(0, 2**31 - 1))
+        self.env_seed = cfg.get("env_seed", None)
+        seed_sequence = np.random.SeedSequence(None if self.env_seed is None else int(self.env_seed))
+        env_seed_seq, fast_fading_seed_seq, jammer_seed_seq = seed_sequence.spawn(3)
+        self._rng = np.random.default_rng(env_seed_seq)
+
+        def _seed_int_from_sequence(seed_seq):
+            return int(seed_seq.generate_state(1, dtype=np.uint32)[0])
 
         self.length = cfg["length"]  # 1000
         self.width = cfg["width"]  # 500
@@ -96,7 +104,6 @@ class Environ(gym.Env):
         self.n_jammer = cfg["n_jammer"]  # number of jammers
         self.n_channel = cfg["n_channel"]  # int(self.n_ch+self.n_jammer-1)  # number of channels
         self.channel_indexes = np.arange(self.n_channel)
-        self.channels = np.zeros([self.n_channel], dtype=np.int32)
         self.states_observed = cfg["states_observed"]  # 信道被干扰或未被干扰
 
         self.p_md = cfg["p_md"]  # 漏警概率
@@ -170,8 +177,11 @@ class Environ(gym.Env):
                 "fast_fading_db_clip_low must be < fast_fading_db_clip_high, got "
                 f"{self.fast_fading_db_clip_low} vs {self.fast_fading_db_clip_high}"
             )
-        fast_fading_seed = _resolve_local_seed(cfg.get("fast_fading_seed", None))
-        self._fast_fading_rng = np.random.default_rng(int(fast_fading_seed))
+        fast_fading_seed = cfg.get("fast_fading_seed", None)
+        if fast_fading_seed is None:
+            self._fast_fading_rng = np.random.default_rng(fast_fading_seed_seq)
+        else:
+            self._fast_fading_rng = np.random.default_rng(int(fast_fading_seed))
         # E[20*log10(|h|)] for Rayleigh (CN(0,1)/sqrt(2)) is approx -2.507 dB.
         # Subtract this mean so that fast fading fluctuates around 0 dB.
         # Derivation: E[ln|h|] = -gamma/2 for Rayleigh(sigma=1/sqrt(2)),
@@ -208,7 +218,9 @@ class Environ(gym.Env):
                 "jammer_reactive_observe_prob must be in [0,1], got "
                 f"{self.jammer_reactive_observe_prob}"
             )
-        jammer_seed = _resolve_local_seed(cfg.get("jammer_seed", None))
+        jammer_seed = cfg.get("jammer_seed", None)
+        if jammer_seed is None:
+            jammer_seed = _seed_int_from_sequence(jammer_seed_seq)
         # Jammer state sampling and partial observation use a private RNG so they
         # remain reproducible without depending on the process-global `random` state.
         self._jammer_state_rng = random.Random(int(jammer_seed))
@@ -225,13 +237,13 @@ class Environ(gym.Env):
         # Jammer behavior: Markov transition matrix plus optional reactive bias
         # from partially observed UAV channel choices.
         self.policy = None  # 对应算法
-        self.training = True
         self.jammer_channels = [0 for _ in range(self.n_jammer)]
         self.jammer_events = []
 
-        self.uav_list = list(np.arange(self.n_uav))
-        self.ch_list = random.sample(self.uav_list, k=self.n_ch)#由于随机数种子的原因，每次都选择2、7、3作为簇头
-        self.cm_list = list(set(self.uav_list) - set(self.ch_list))
+        self.uav_list = list(range(int(self.n_uav)))
+        self.ch_list = self._sample_without_replacement(self.uav_list, self.n_ch)
+        ch_set = set(self.ch_list)
+        self.cm_list = [uav_id for uav_id in self.uav_list if uav_id not in ch_set]
         self.rp_list = self.uav_list
         self.rp_ch_list = self.ch_list
         self.rp_cm_list = self.cm_list
@@ -244,7 +256,7 @@ class Environ(gym.Env):
         self.action_dim = int(self.n_channel ** self.n_des)
         self.param_dim_per_action = int(self.n_des)
         self.total_param_dim = int(self.action_dim * self.param_dim_per_action)
-        self.action_space = [
+        self.agent_action_spaces = [
             spaces.Tuple(
                 (
                     spaces.Discrete(self.action_dim),
@@ -253,6 +265,7 @@ class Environ(gym.Env):
             )
             for _ in range(self.n_ch)
         ]
+        self.action_space = self.agent_action_spaces  # Legacy alias used by existing training code.
 
         #与奖励相关参数
         self.uav_jump_count = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
@@ -261,12 +274,17 @@ class Environ(gym.Env):
         self.rew_suc = 0
 
         self.episode_step = 0
+        self._episode_initialized = False
 
-        # 初始化观察状态和环境
+        # 初始化静态观察/干扰状态空间。Episode state is created lazily by reset().
         self.all_observed_states()
-        self.reset(self.generate_p_trans())
-        self.state_dim = len(self.get_state()[0])
-        self.observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(self.state_dim,)) for _ in range(self.n_ch)]
+        self.set_p(self.generate_p_trans())
+        self.state_dim = self._compute_state_dim()
+        self.agent_observation_spaces = [
+            spaces.Box(low=-np.inf, high=+np.inf, shape=(self.state_dim,))
+            for _ in range(self.n_ch)
+        ]
+        self.observation_space = self.agent_observation_spaces  # Legacy alias used by existing training code.
 
     def _sample_complex_gaussian(self, shape):
         real = self._fast_fading_rng.normal(0.0, 1.0, size=shape).astype(np.float32)
@@ -310,33 +328,43 @@ class Environ(gym.Env):
         self.observed_state_dim = int(comb(self.n_channel, self.n_jammer)) # comb返回从 n_channel 种可能性中选择n_jammer个无序结果的方式数量，无重复，也称为组合。
         self.all_observed_states_list.extend(list(combinations(self.channel_indexes, self.n_jammer)))
 
+    def _compute_state_dim(self):
+        if self.policy == "Sensing_Based_Method":
+            return int(self.n_channel)
+        if self.policy == "Q_learning":
+            raise NotImplementedError("Q_learning policy is not supported in continuous-power (MP-DQN) mode.")
+        return int((self.n_des + 1) * self.n_channel)
+
+    def _sample_without_replacement(self, population, k):
+        population = list(population)
+        if int(k) > len(population):
+            raise ValueError(f"Cannot sample {k} items from population of size {len(population)}")
+        indices = self._rng.choice(len(population), size=int(k), replace=False)
+        return [population[int(idx)] for idx in np.asarray(indices).reshape(-1)]
+
     def renew_uavs(self):
         for i in range(self.n_ch):
             # 更新簇头无人机的位置
             ch_id = self.ch_list[i]
 
-            start_velocity = random.uniform(10, 20)
-            start_direction = random.uniform(0, 2 * math.pi)
-            start_p = random.uniform(0, 2 * math.pi)
+            start_velocity = float(self._rng.uniform(10.0, 20.0))
+            start_direction = float(self._rng.uniform(0.0, 2 * math.pi))
+            start_p = float(self._rng.uniform(0.0, 2 * math.pi))
 
-            ch_xpos = random.uniform(0.0, self.length)
-            ch_ypos = random.uniform(0.0, self.width)
-            ch_zpos = random.uniform(self.low_height, self.high_height)
+            ch_xpos = float(self._rng.uniform(0.0, self.length))
+            ch_ypos = float(self._rng.uniform(0.0, self.width))
+            ch_zpos = float(self._rng.uniform(self.low_height, self.high_height))
             start_position = [ch_xpos, ch_ypos, ch_zpos]
 
             self.uavs[ch_id] = UAV(start_position, start_direction, start_velocity, start_p)
             self.rps[ch_id] = RP(start_position)
-
-            self.uavs[ch_id].uav_velocity.append(start_velocity)
-            self.uavs[ch_id].uav_direction.append(start_direction)
-            self.uavs[ch_id].uav_p.append(start_p)
 
     def renew_uav_clusters(self):
         cm_list = deepcopy(self.cm_list)
         rp_cm_list = deepcopy(self.rp_cm_list)
         for i in range(self.n_ch):
             ch_id = self.ch_list[i]
-            cms = random.sample(cm_list, k=self.n_cm_for_a_ch)
+            cms = self._sample_without_replacement(cm_list, self.n_cm_for_a_ch)
             rps = cms
             for j in range(self.n_cm_for_a_ch):
                 self.uav_clusters[i][j][0] = ch_id
@@ -349,27 +377,27 @@ class Environ(gym.Env):
                 ch_pos = [self.uavs[ch_id].position[0], self.uavs[ch_id].position[1], self.uavs[ch_id].position[2]]
 
                 # 参考节点的位置设定
-                R1 = random.uniform(0.0, self.max_distance1)
-                d1 = random.uniform(0.0, 2 * math.pi)
-                p1 = random.uniform(0.0, 2 * math.pi)
+                R1 = float(self._rng.uniform(0.0, self.max_distance1))
+                d1 = float(self._rng.uniform(0.0, 2 * math.pi))
+                p1 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                 rp_xpos = ch_pos[0] + R1 * math.cos(d1) * math.cos(p1)
                 rp_ypos = ch_pos[1] + R1 * math.sin(d1) * math.cos(p1)
                 rp_zpos = ch_pos[2] + R1 * math.sin(p1)
                 while ((rp_xpos < 0) or (rp_xpos > self.length) or (rp_ypos < 0) or (rp_ypos > self.width) or (
                         rp_zpos < self.low_height) or (rp_zpos > self.high_height)):
-                    R1 = random.uniform(0.0, R1)
-                    d1 = random.uniform(0.0, 2 * math.pi)
-                    p1 = random.uniform(0.0, 2 * math.pi)
+                    R1 = float(self._rng.uniform(0.0, R1))
+                    d1 = float(self._rng.uniform(0.0, 2 * math.pi))
+                    p1 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                     rp_xpos = ch_pos[0] + R1 * math.cos(d1) * math.cos(p1)
                     rp_ypos = ch_pos[1] + R1 * math.sin(d1) * math.cos(p1)
                     rp_zpos = ch_pos[2] + R1 * math.sin(p1)
 
                 # 簇内节点的位置设定
-                R2 = random.uniform(0.0, self.max_distance2)
-                d2 = random.uniform(0.0, 2 * math.pi)
-                p2 = random.uniform(0.0, 2 * math.pi)
+                R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                 cm_xpos = rp_xpos + R2 * math.cos(d2) * math.cos(p2)
                 cm_ypos = rp_ypos + R2 * math.sin(d2) * math.cos(p2)
@@ -378,9 +406,9 @@ class Environ(gym.Env):
                 while ((cm_xpos < 0) or (cm_xpos > self.length) or (cm_ypos < 0) or (cm_ypos > self.width) or (
                         cm_zpos < self.low_height) or (cm_zpos > self.high_height)):
                     # 簇内节点的位置设定
-                    R2 = random.uniform(0.0, self.max_distance2)
-                    d2 = random.uniform(0.0, 2 * math.pi)
-                    p2 = random.uniform(0.0, 2 * math.pi)
+                    R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                    d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                    p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                     cm_xpos = rp_xpos + R2 * math.cos(d2) * math.cos(p2)
                     cm_ypos = rp_ypos + R2 * math.sin(d2) * math.cos(p2)
@@ -397,8 +425,10 @@ class Environ(gym.Env):
                 self.uavs[cms[j]].destinations.append(ch_id)
                 self.rps[rps[j]] = RP(start_position_rp)
 
-            cm_list = list(set(cm_list) - set(cms))
-            rp_cm_list = list(set(rp_cm_list) - set(rps))
+            cms_set = set(cms)
+            rps_set = set(rps)
+            cm_list = [cm_id for cm_id in cm_list if cm_id not in cms_set]
+            rp_cm_list = [rp_id for rp_id in rp_cm_list if rp_id not in rps_set]
 
         # print(self.uav_clusters)
         # print(self.uav_pairs)
@@ -406,25 +436,23 @@ class Environ(gym.Env):
     def renew_jammers(self):
         if self.is_jammer_moving:
             for i in range(self.n_jammer):
-                start_velocity = random.uniform(10.0, 20.0)
-                start_direction = random.uniform(0, 2 * math.pi)
-                start_p = random.uniform(0, 2 * math.pi)
+                start_velocity = float(self._rng.uniform(10.0, 20.0))
+                start_direction = float(self._rng.uniform(0.0, 2 * math.pi))
+                start_p = float(self._rng.uniform(0.0, 2 * math.pi))
 
-                xpos = random.uniform(0.0, self.length)
-                ypos = random.uniform(0.0, self.width)
-                zpos = random.uniform(self.low_height, self.high_height)
+                xpos = float(self._rng.uniform(0.0, self.length))
+                ypos = float(self._rng.uniform(0.0, self.width))
+                zpos = float(self._rng.uniform(self.low_height, self.high_height))
                 start_position = [xpos, ypos, zpos]
 
                 self.jammers.append(Jammer(start_position, start_direction, start_velocity, start_p))
-                self.jammers[i].jammer_velocity.append(start_velocity)
-                self.jammers[i].jammer_direction.append(start_direction)
-                self.jammers[i].jammer_p.append(start_p)
 
     def new_random_game(self):
         # self.all_observed_states()
         self.t_uav = 0.0
         self.t_jammer = 0.0
         self.episode_step = 0
+        self._episode_initialized = True
         self._jammer_observed_channel_history.clear()
         # 一个发送机若有多个通信目标，每个元素是智能体为每个通信目标分配的信道，假设各不相同
         self.uav_channels = np.zeros([self.n_ch, self.n_des], dtype=np.int32)   # 每个智能体观察到的全局动作（假设智能体可以观察到其他智能体已经完成的动作）
@@ -432,8 +460,8 @@ class Environ(gym.Env):
         self.uav_jump_count = np.zeros([self.n_ch, self.n_des], dtype=np.int32)
         for i in range(self.n_ch):
             for j in range(self.n_des):
-                self.uav_channels[i][j] = random.randint(0, self.n_channel - 1)  #包括上下限
-                self.uav_powers[i][j] = random.uniform(self.uav_power_min, self.uav_power_max)  # dBm
+                self.uav_channels[i][j] = int(self._rng.integers(0, self.n_channel))
+                self.uav_powers[i][j] = float(self._rng.uniform(self.uav_power_min, self.uav_power_max))  # dBm
         init_jammer_state(self)
 
         # print("jammer_channels", self.jammer_channels)
@@ -454,6 +482,9 @@ class Environ(gym.Env):
         self.renew_channels()
 
     def get_state(self):
+        if not self._episode_initialized:
+            raise RuntimeError("Environment episode state is not initialized. Call reset() before get_state().")
+
         if self.policy == "Q_learning":
             raise NotImplementedError("Q_learning policy is not supported in continuous-power (MP-DQN) mode.")
 
@@ -469,12 +500,12 @@ class Environ(gym.Env):
                 channels_observed = np.zeros([self.n_channel], dtype=np.int32)
                 for i in range(self.n_channel):
                     if i in jammer_channels:
-                        if random.random() < self.p_md:
+                        if float(self._rng.random()) < self.p_md:
                             channels_observed[i] = 0  # 漏警
                         else:
                             channels_observed[i] = 1  # 发现干扰
                     else:
-                        if random.random() < self.p_fa:
+                        if float(self._rng.random()) < self.p_fa:
                             channels_observed[i] = 1  # 虚警
                         else:
                             channels_observed[i] = 0  # 发现未干扰
@@ -493,7 +524,7 @@ class Environ(gym.Env):
                     pathloss_vec = self.UAVchannels_loss_db[tra_id, rec_id, :].astype(np.float32)  # (n_channel,)
                     csi_ij = (pathloss_vec - self.csi_pathloss_offset) / self.csi_pathloss_scale
                     if self.csi_noise_std > 0.0:
-                        csi_ij = csi_ij + np.random.normal(
+                        csi_ij = csi_ij + self._rng.normal(
                             0.0,
                             self.csi_noise_std,
                             size=self.n_channel,
@@ -548,7 +579,7 @@ class Environ(gym.Env):
 
                 # 可选：感知噪声（默认 0，不引入随机性）
                 if self.sensing_noise_std > 0.0:
-                    z += np.random.normal(0.0, self.sensing_noise_std, size=self.n_channel).astype(np.float32)
+                    z += self._rng.normal(0.0, self.sensing_noise_std, size=self.n_channel).astype(np.float32)
 
                 mu = float(np.mean(z))
                 std = float(np.std(z))
@@ -756,18 +787,22 @@ class Environ(gym.Env):
             self.uavs[i].position = [xpos, ypos, zpos]
             # self.rps[i].position = self.uavs[i].position
 
-            self.uavs[i].velocity = self.k * self.uavs[i].velocity + (1 - self.k) * np.average(
-                self.uavs[i].uav_velocity) + (
-                                            1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-            self.uavs[i].direction = self.k * self.uavs[i].direction + (1 - self.k) * np.average(
-                self.uavs[i].uav_direction) + (
-                                             1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-            self.uavs[i].p = self.k * self.uavs[i].p + (1 - self.k) * np.average(self.uavs[i].uav_p) + (
-                        1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-
-            self.uavs[i].uav_velocity.append(self.uavs[i].velocity)
-            self.uavs[i].uav_direction.append(self.uavs[i].direction)
-            self.uavs[i].uav_p.append(self.uavs[i].p)
+            noise_scale = (1 - self.k ** 2) ** 0.5
+            self.uavs[i].velocity = (
+                self.k * self.uavs[i].velocity
+                + (1 - self.k) * self.uavs[i].mean_velocity
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
+            self.uavs[i].direction = (
+                self.k * self.uavs[i].direction
+                + (1 - self.k) * self.uavs[i].mean_direction
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
+            self.uavs[i].p = (
+                self.k * self.uavs[i].p
+                + (1 - self.k) * self.uavs[i].mean_p
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
 
     def renew_positions_of_cms(self):
         for i in range(self.n_ch):
@@ -778,9 +813,9 @@ class Environ(gym.Env):
             if self.xyz_delta_dis[i] == [0, 0, 0]:
                 for j in cm_id:
                     # 更新参考点的位置
-                    R1 = random.uniform(0, self.max_distance1)
-                    d1 = random.uniform(0, 2 * math.pi)
-                    p1 = random.uniform(0, 2 * math.pi)
+                    R1 = float(self._rng.uniform(0.0, self.max_distance1))
+                    d1 = float(self._rng.uniform(0.0, 2 * math.pi))
+                    p1 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                     rp_xpos = ch_pos[0] + R1 * math.cos(d1) * math.cos(p1)
                     rp_ypos = ch_pos[1] + R1 * math.sin(d1) * math.cos(p1)
@@ -788,9 +823,9 @@ class Environ(gym.Env):
 
                     while ((rp_xpos < 0) or (rp_xpos > self.length) or (rp_ypos < 0) \
                            or (rp_ypos > self.width) or (rp_zpos < self.low_height) or (rp_zpos > self.high_height)):
-                        R1 = random.uniform(0, R1)
-                        d1 = random.uniform(0, 2 * math.pi)
-                        p1 = random.uniform(0, 2 * math.pi)
+                        R1 = float(self._rng.uniform(0.0, R1))
+                        d1 = float(self._rng.uniform(0.0, 2 * math.pi))
+                        p1 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                         rp_xpos = ch_pos[0] + R1 * math.cos(d1) * math.cos(p1)
                         rp_ypos = ch_pos[1] + R1 * math.sin(d1) * math.cos(p1)
@@ -799,9 +834,9 @@ class Environ(gym.Env):
                     self.rps[j].position = rp_pos
 
                     # 更新簇内节点的位置
-                    R2 = random.uniform(0, self.max_distance2)
-                    d2 = random.uniform(0, 2 * math.pi)
-                    p2 = random.uniform(0, 2 * math.pi)
+                    R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                    d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                    p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                     cm_xpos = rp_pos[0] + R2 * math.cos(d2) * math.cos(p2)
                     cm_ypos = rp_pos[1] + R2 * math.sin(d2) * math.cos(p2)
@@ -813,9 +848,9 @@ class Environ(gym.Env):
                            or (self.uavs[j].position[1] > self.width) or (
                                    self.uavs[j].position[2] < self.low_height) or (
                                    self.uavs[j].position[2] > self.high_height)):
-                        R2 = random.uniform(0, self.max_distance2)
-                        d2 = random.uniform(0, 2 * math.pi)
-                        p2 = random.uniform(0, 2 * math.pi)
+                        R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                        d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                        p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                         cm_xpos = rp_pos[0] + R2 * math.cos(d2) * math.cos(p2)
                         cm_ypos = rp_pos[1] + R2 * math.sin(d2) * math.cos(p2)
@@ -850,9 +885,9 @@ class Environ(gym.Env):
                     self.rps[j].position = rp_pos
 
                     # 更新簇内节点的位置
-                    R2 = random.uniform(0, self.max_distance2)
-                    d2 = random.uniform(0, 2 * math.pi)
-                    p2 = random.uniform(0, 2 * math.pi)
+                    R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                    d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                    p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                     cm_xpos = rp_pos[0] + R2 * math.cos(d2) * math.cos(p2)
                     cm_ypos = rp_pos[1] + R2 * math.sin(d2) * math.cos(p2)
@@ -860,9 +895,9 @@ class Environ(gym.Env):
 
                     while ((cm_xpos < 0) or (cm_xpos > self.length) or (cm_ypos < 0) or (cm_ypos > self.width) or (
                             cm_zpos < self.low_height) or (cm_zpos > self.high_height)):
-                        R2 = random.uniform(0, self.max_distance2)
-                        d2 = random.uniform(0, 2 * math.pi)
-                        p2 = random.uniform(0, 2 * math.pi)
+                        R2 = float(self._rng.uniform(0.0, self.max_distance2))
+                        d2 = float(self._rng.uniform(0.0, 2 * math.pi))
+                        p2 = float(self._rng.uniform(0.0, 2 * math.pi))
 
                         cm_xpos = self.rps[j].position[0] + R2 * math.cos(d2) * math.cos(p2)
                         cm_ypos = self.rps[j].position[1] + R2 * math.sin(d2) * math.cos(p2)
@@ -917,16 +952,22 @@ class Environ(gym.Env):
 
             self.jammers[i].position = [xpos, ypos, zpos]
 
-            self.jammers[i].velocity = self.k * self.jammers[i].velocity + (1 - self.k) * np.average(
-                self.jammers[i].jammer_velocity) + (1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-            self.jammers[i].direction = self.k * self.jammers[i].direction + (1 - self.k) * np.average(
-                self.jammers[i].jammer_direction) + (1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-            self.jammers[i].p = self.k * self.jammers[i].p + (1 - self.k) * np.average(self.jammers[i].jammer_p) + (
-                        1 - self.k ** 2) ** 0.5 * np.random.normal(0, self.sigma)
-
-            self.jammers[i].jammer_velocity.append(self.jammers[i].velocity)
-            self.jammers[i].jammer_direction.append(self.jammers[i].direction)
-            self.jammers[i].jammer_p.append(self.jammers[i].p)
+            noise_scale = (1 - self.k ** 2) ** 0.5
+            self.jammers[i].velocity = (
+                self.k * self.jammers[i].velocity
+                + (1 - self.k) * self.jammers[i].mean_velocity
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
+            self.jammers[i].direction = (
+                self.k * self.jammers[i].direction
+                + (1 - self.k) * self.jammers[i].mean_direction
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
+            self.jammers[i].p = (
+                self.k * self.jammers[i].p
+                + (1 - self.k) * self.jammers[i].mean_p
+                + noise_scale * self._rng.normal(0.0, self.sigma)
+            )
             i += 1
 
     def renew_channels(self):
@@ -1027,13 +1068,17 @@ class Environ(gym.Env):
             )
         self.p_trans = p_arr
 
-    def reset(self, p_trans):
-        self.set_p(p_trans)
+    def reset(self, p_trans=None):
+        if p_trans is not None:
+            self.set_p(p_trans)
         self.new_random_game()
         state = self.get_state()
         return state
 
     def step(self, a):
+        if not self._episode_initialized:
+            raise RuntimeError("Environment episode state is not initialized. Call reset() before step().")
+
         # NOTE: `a` comes from the caller (and in our training it is freshly created each step).
         # `decomposition_action()` does not mutate the action container, so `deepcopy` is unnecessary
         # and can become a major overhead when running many env steps in parallel workers.
