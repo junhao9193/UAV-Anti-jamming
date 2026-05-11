@@ -23,7 +23,14 @@ from typing import Optional, Tuple
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, resolve_episode_steps, save_training_data
+from Main.common import (
+    SubprocVecEnv,
+    env_run_config,
+    get_repo_root,
+    make_fixed_p_trans,
+    resolve_episode_steps,
+    save_training_data,
+)
 from tqdm.auto import trange
 
 
@@ -417,6 +424,43 @@ def train_qmix_value_expansion(
             n_episode=n_episode,
             n_steps=n_steps,
             trainer=qmix,
+            run_config={
+                "algorithm": "mpdqn_qmix_wmve_rssm",
+                "seed": int(seed),
+                "num_envs": int(num_envs),
+                "batch_size": int(batch_size),
+                "buffer_capacity": int(buffer_capacity),
+                "learn_every": int(learn_every),
+                "updates_per_learn": int(updates_per_learn),
+                "lr_actor": float(lr_actor),
+                "lr_q": float(lr_q),
+                "lr_mixer": None if lr_mixer is None else float(lr_mixer),
+                "max_grad_norm": float(max_grad_norm),
+                "use_amp": bool(use_amp),
+                "device": str(device),
+                "start_method": str(start_method),
+                "seq_len": int(seq_len),
+                "wm_buffer_capacity": int(wm_buffer_capacity),
+                "wm_hidden_dim": int(wm_hidden_dim),
+                "wm_n_layers": int(wm_n_layers),
+                "wm_stochastic_dim": int(wm_stochastic_dim),
+                "wm_kl_beta": float(wm_kl_beta),
+                "wm_free_nats": float(wm_free_nats),
+                "wm_lr": float(wm_lr),
+                "wm_max_grad_norm": float(wm_max_grad_norm),
+                "wm_batch_size": int(wm_batch_size),
+                "wm_updates_per_learn": int(wm_updates_per_learn),
+                "gamma": float(gamma),
+                "lam": float(lam),
+                "rollout_k": int(rollout_k),
+                "critic_warmup_ep": int(critic_warmup_ep),
+                "model_warmup_ep": int(model_warmup_ep),
+                "ramp_start_ep": int(ramp_start_ep),
+                "ramp_end_ep": int(ramp_end_ep),
+                "alpha_model_max": float(alpha_model_max),
+                "eta_max": float(eta_max),
+                **env_run_config(env0),
+            },
         )
 
         # Save world model checkpoint into the same experiment directory.

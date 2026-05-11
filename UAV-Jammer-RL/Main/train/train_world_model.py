@@ -19,7 +19,14 @@ from typing import Optional, Tuple
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, make_unique_output_dir, resolve_episode_steps
+from Main.common import (
+    SubprocVecEnv,
+    env_run_config,
+    get_repo_root,
+    make_fixed_p_trans,
+    make_unique_output_dir,
+    resolve_episode_steps,
+)
 from tqdm.auto import trange
 
 
@@ -403,6 +410,7 @@ def train_world_model(
         "eta": float(eta),
         "lr": float(lr),
         "device": str(device),
+        **env_run_config(env0),
         "env": {
             "n_agents": int(n_agents),
             "agent_state_dim": int(agent_state_dim),
@@ -496,5 +504,3 @@ if __name__ == "__main__":
         start_method=str(args.start_method),
         save=(not bool(args.no_save)),
     )
-
-

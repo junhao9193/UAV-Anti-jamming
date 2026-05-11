@@ -9,6 +9,8 @@ from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
 
+from envs.config import CANONICAL_ENV_CONFIG_PATH
+
 
 def get_repo_root() -> Path:
     # .../MetaRL-for-UAV-Anti-jamming/UAV-Jammer-RL/Main/common.py -> repo root is parents[2]
@@ -21,18 +23,10 @@ def get_project_root() -> Path:
     return Path(__file__).absolute().parents[1]
 
 
-def resolve_env_config_path(config_path: Optional[str] = None) -> Optional[str]:
-    """Return an absolute env config path, defaulting to `configs/env.yaml` when present."""
-    if config_path is None:
-        default_path = get_project_root() / "configs" / "env.yaml"
-        return str(default_path.absolute()) if default_path.exists() else None
-
-    path = Path(config_path).expanduser()
-    if not path.is_absolute():
-        path = (Path.cwd() / path).absolute()
-    if not path.exists():
-        raise FileNotFoundError(f"env config file not found: {path}")
-    return str(path)
+def default_env_config_path() -> Optional[str]:
+    """Return the single env config path used by Main entry points."""
+    path = CANONICAL_ENV_CONFIG_PATH
+    return str(path.absolute()) if path.exists() else None
 
 
 def _file_sha256(path: Optional[str]) -> Optional[str]:
@@ -48,9 +42,9 @@ def _file_sha256(path: Optional[str]) -> Optional[str]:
     return h.hexdigest()
 
 
-def env_run_config(env: Any, config_path: Optional[str] = None) -> dict:
+def env_run_config(env: Any) -> dict:
     """Small, stable metadata snapshot for comparing experiments across env configs."""
-    resolved = resolve_env_config_path(config_path)
+    resolved = default_env_config_path()
     keys = [
         "n_ch",
         "n_des",
@@ -383,7 +377,8 @@ def make_fixed_p_trans(env) -> np.ndarray:
     p_trans = env.generate_p_trans(rng=rng)
     return np.asarray(p_trans, dtype=np.float32)
 
-def _env_worker(remote, parent_remote, config_path: Optional[str], p_trans: Optional[np.ndarray], worker_seed: Optional[int] = None) -> None:
+
+def _env_worker(remote, parent_remote, p_trans: Optional[np.ndarray], worker_seed: Optional[int] = None) -> None:
     """
     Subprocess worker for environment stepping.
 
@@ -408,7 +403,7 @@ def _env_worker(remote, parent_remote, config_path: Optional[str], p_trans: Opti
             np.random.seed(int(worker_seed) % (2**31))
 
         env_config = {"env_seed": int(worker_seed)} if worker_seed is not None else None
-        env = Environ(config=env_config, config_path=config_path) if config_path else Environ(config=env_config)
+        env = Environ(config=env_config)
         if p_trans is not None:
             env.set_p(p_trans)
 
@@ -449,7 +444,6 @@ class SubprocVecEnv:
         self,
         n_envs: int,
         *,
-        config_path: Optional[str] = None,
         p_trans: Optional[np.ndarray] = None,
         start_method: str = "spawn",
         seed: Optional[int] = None,
@@ -463,7 +457,7 @@ class SubprocVecEnv:
         self.ps = []
         for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
             worker_seed = (int(seed) + i * 1000) if seed is not None else None
-            p = ctx.Process(target=_env_worker, args=(work_remote, remote, config_path, p_trans, worker_seed), daemon=True)
+            p = ctx.Process(target=_env_worker, args=(work_remote, remote, p_trans, worker_seed), daemon=True)
             p.start()
             self.ps.append(p)
             work_remote.close()
@@ -520,7 +514,7 @@ class SubprocVecEnv:
 __all__ = [
     "get_repo_root",
     "get_project_root",
-    "resolve_env_config_path",
+    "default_env_config_path",
     "resolve_episode_steps",
     "env_run_config",
     "validate_positive_run_args",

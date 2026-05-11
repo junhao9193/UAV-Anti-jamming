@@ -21,7 +21,6 @@ from Main.common import (
     SubprocVecEnv,
     env_run_config,
     make_fixed_p_trans,
-    resolve_env_config_path,
     resolve_episode_steps,
     save_training_data,
     validate_positive_run_args,
@@ -51,7 +50,7 @@ def _load_mpdqn_agents(weights_path: str | Path, *, env0: Environ, device: str):
             if key in agent_cfg and int(agent_cfg[key]) != int(expected_val):
                 raise ValueError(
                     f"Checkpoint agent_config[{key}]={agent_cfg[key]} does not match "
-                    f"current env {key}={expected_val}. Check --config-path / env.yaml."
+                    f"current env {key}={expected_val}. Check configs/env.yaml."
                 )
 
     agents = []
@@ -89,7 +88,6 @@ def evaluate_policy(
     save_data: bool = True,
     start_method: str = "spawn",
     seed: int = 0,
-    config_path: str | None = None,
 ) -> dict[str, list[float]]:
     import torch
 
@@ -104,7 +102,6 @@ def evaluate_policy(
     requested_power_mode = str(power_mode)
     if mode == "heuristic":
         power_mode = normalize_power_mode(heuristic_policy, power_mode)
-    config_path = resolve_env_config_path(config_path)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -112,7 +109,7 @@ def evaluate_policy(
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
 
-    env0 = Environ(config_path=config_path)
+    env0 = Environ()
     n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
 
@@ -139,7 +136,6 @@ def evaluate_policy(
 
     vecenv = SubprocVecEnv(
         int(num_envs),
-        config_path=config_path,
         p_trans=p_trans_fixed,
         start_method=str(start_method),
         seed=int(seed),
@@ -235,7 +231,7 @@ def evaluate_policy(
                 "device": str(device),
                 "epsilon": 0.0 if mode == "mpdqn" else None,
                 "evaluation_only": True,
-                **env_run_config(env0, config_path),
+                **env_run_config(env0),
             },
             artifact_kind="eval",
         )
@@ -261,7 +257,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--config-path", type=str, default=None, help="Env YAML config path (default: configs/env.yaml)")
     parser.add_argument("--no-save", action="store_true", help="Disable saving metrics")
     return parser
 
@@ -281,7 +276,6 @@ def main() -> None:
         save_data=not bool(args.no_save),
         start_method=str(args.start_method),
         seed=int(args.seed),
-        config_path=args.config_path,
     )
 
 

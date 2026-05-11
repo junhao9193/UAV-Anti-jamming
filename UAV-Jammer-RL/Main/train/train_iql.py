@@ -7,7 +7,14 @@ import argparse
 import numpy as np
 
 from envs import Environ
-from Main.common import SubprocVecEnv, make_fixed_p_trans, resolve_episode_steps, save_training_data
+from Main.common import (
+    SubprocVecEnv,
+    env_run_config,
+    make_fixed_p_trans,
+    resolve_episode_steps,
+    save_training_data,
+    validate_positive_run_args,
+)
 from tqdm.auto import trange
 
 
@@ -40,6 +47,8 @@ def train_mpdqn_iql(
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
+
+    validate_positive_run_args(n_episode=n_episode, n_steps=n_steps, num_envs=num_envs)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -197,6 +206,25 @@ def train_mpdqn_iql(
             n_episode=n_episode,
             n_steps=n_steps,
             trainer=trainer,
+            run_config={
+                "algorithm": "mpdqn_iql",
+                "seed": int(seed),
+                "num_envs": int(num_envs),
+                "batch_size": int(batch_size),
+                "buffer_capacity": int(buffer_capacity),
+                "learn_every": int(learn_every),
+                "updates_per_learn": int(updates_per_learn),
+                "lr_actor": float(lr_actor),
+                "lr_q": float(lr_q),
+                "epsilon_start": 1.0,
+                "epsilon_min": float(epsilon_min),
+                "epsilon_decay": float(epsilon_decay),
+                "max_grad_norm": float(max_grad_norm),
+                "use_amp": bool(use_amp),
+                "device": str(device),
+                "start_method": str(start_method),
+                **env_run_config(env0),
+            },
         )
 
     return trainer.agents, {

@@ -9,7 +9,7 @@ import argparse
 import numpy as np
 
 from envs import Environ
-from Main.common import make_fixed_p_trans, resolve_episode_steps, save_training_data
+from Main.common import env_run_config, make_fixed_p_trans, resolve_episode_steps, save_training_data
 from tqdm.auto import trange
 
 
@@ -183,6 +183,21 @@ def train_mappo(
             n_episode=n_episode,
             n_steps=n_steps,
             trainer=agent,
+            run_config={
+                "algorithm": "mappo",
+                "seed": int(seed),
+                "lr": float(lr),
+                "gamma": float(gamma),
+                "gae_lambda": float(gae_lambda),
+                "clip_range": float(clip_range),
+                "ent_coef": float(ent_coef),
+                "vf_coef": float(vf_coef),
+                "update_epochs": int(update_epochs),
+                "minibatch_size": int(minibatch_size),
+                "max_grad_norm": float(max_grad_norm),
+                "device": str(device),
+                **env_run_config(env),
+            },
         )
 
     return agent, {

@@ -14,7 +14,6 @@ from Main.common import (
     SubprocVecEnv,
     env_run_config,
     make_fixed_p_trans,
-    resolve_env_config_path,
     resolve_episode_steps,
     save_training_data,
     validate_positive_run_args,
@@ -32,7 +31,6 @@ def run_heuristic(
     start_method: str = "spawn",
     seed: int = 0,
     power_mode: str = "quality_adaptive",
-    config_path: str | None = None,
 ):
     from algorithms.heuristic import HeuristicDims, build_heuristic_policy, normalize_power_mode
 
@@ -42,14 +40,12 @@ def run_heuristic(
     np.random.seed(int(seed))
     requested_power_mode = str(power_mode)
     power_mode = normalize_power_mode(policy_name, power_mode)
-    config_path = resolve_env_config_path(config_path)
 
-    env0 = Environ(config_path=config_path)
+    env0 = Environ()
     n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
     vecenv = SubprocVecEnv(
         int(num_envs),
-        config_path=config_path,
         p_trans=p_trans_fixed,
         start_method=str(start_method),
         seed=int(seed),
@@ -144,7 +140,7 @@ def run_heuristic(
                 "num_envs": int(num_envs),
                 "start_method": str(start_method),
                 "evaluation_only": True,
-                **env_run_config(env0, config_path),
+                **env_run_config(env0),
             },
             artifact_kind="eval",
         )
@@ -167,7 +163,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--power-mode", type=str, default="quality_adaptive", choices=["quality_adaptive", "fixed_mid", "fixed_low", "random"])
-    parser.add_argument("--config-path", type=str, default=None, help="Env YAML config path (default: configs/env.yaml)")
     parser.add_argument("--no-save", action="store_true", help="Disable saving metrics")
     return parser
 
@@ -189,7 +184,6 @@ def main() -> None:
         start_method=str(args.start_method),
         seed=int(args.seed),
         power_mode=str(args.power_mode),
-        config_path=args.config_path,
     )
     print("Evaluation completed!")
 

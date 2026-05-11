@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from Main.common import get_repo_root, resolve_env_config_path, validate_positive_run_args
+from Main.common import get_repo_root, validate_positive_run_args
 from Main.evaluate.evaluate_mappo import evaluate_mappo
 from Main.evaluate.evaluate_mpdqn import evaluate_policy
 
@@ -54,10 +54,8 @@ def evaluate_all_baselines(
     save_data: bool = True,
     start_method: str = "spawn",
     seed: int = 0,
-    config_path: str | None = None,
 ) -> dict:
     validate_positive_run_args(n_episode=n_episode, n_steps=n_steps, num_envs=num_envs)
-    config_path = resolve_env_config_path(config_path)
     experiments_root = str(Path(experiments_root or _default_experiments_root()).expanduser().absolute())
 
     root = Path(experiments_root)
@@ -97,7 +95,6 @@ def evaluate_all_baselines(
                 save_data=bool(save_data),
                 start_method=str(start_method),
                 seed=int(seed),
-                config_path=config_path,
             )
         elif kind == "mappo":
             evaluate_mappo(
@@ -110,7 +107,6 @@ def evaluate_all_baselines(
                 save_data=bool(save_data),
                 start_method=str(start_method),
                 seed=int(seed),
-                config_path=config_path,
             )
 
         results["evaluated"].append({
@@ -148,7 +144,6 @@ def evaluate_all_baselines(
                 save_data=bool(save_data),
                 start_method=str(start_method),
                 seed=int(seed),
-                config_path=config_path,
             )
             results["evaluated"].append({
                 "folder": policy,
@@ -175,7 +170,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--config-path", type=str, default=None, help="Env YAML config path (default: configs/env.yaml)")
     parser.add_argument("--no-save", action="store_true", help="Disable saving metrics")
     return parser
 
@@ -194,7 +188,6 @@ def main() -> None:
         save_data=not bool(args.no_save),
         start_method=str(args.start_method),
         seed=int(args.seed),
-        config_path=args.config_path,
     )
 
 

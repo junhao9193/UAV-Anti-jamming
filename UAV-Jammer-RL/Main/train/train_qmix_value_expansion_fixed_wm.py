@@ -23,7 +23,14 @@ import numpy as np
 from tqdm.auto import trange
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, resolve_episode_steps, save_training_data
+from Main.common import (
+    SubprocVecEnv,
+    env_run_config,
+    get_repo_root,
+    make_fixed_p_trans,
+    resolve_episode_steps,
+    save_training_data,
+)
 
 
 def _find_latest_weights(*, repo_root: Path, prefix: str, filename: str) -> Path:
@@ -163,7 +170,12 @@ def train_qmix_value_expansion_fixed_wm(
     env0 = Environ()
     n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
-    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method), seed=int(seed))
+    vecenv = SubprocVecEnv(
+        int(num_envs),
+        p_trans=p_trans_fixed,
+        start_method=str(start_method),
+        seed=int(seed),
+    )
 
     # --- QMIX ---
     qmix = MPDQNQMIXTrainer(
@@ -365,6 +377,34 @@ def train_qmix_value_expansion_fixed_wm(
             n_episode=int(n_episode),
             n_steps=int(n_steps),
             trainer=qmix,
+            run_config={
+                "algorithm": algorithm,
+                "seed": int(seed),
+                "num_envs": int(num_envs),
+                "batch_size": int(batch_size),
+                "buffer_capacity": int(buffer_capacity),
+                "learn_every": int(learn_every),
+                "updates_per_learn": int(updates_per_learn),
+                "lr_actor": float(lr_actor),
+                "lr_q": float(lr_q),
+                "lr_mixer": None if lr_mixer is None else float(lr_mixer),
+                "max_grad_norm": float(max_grad_norm),
+                "use_amp": bool(use_amp),
+                "device": str(device),
+                "start_method": str(start_method),
+                "qmix_weights": str(qmix_weights) if qmix_weights is not None else None,
+                "world_model_weights": str(world_model_weights),
+                "alpha_model": float(alpha_model),
+                "gamma": float(gamma),
+                "lam": float(lam),
+                "rollout_k": int(rollout_k),
+                "seq_len": int(seq_len),
+                "wm_buffer_capacity": int(wm_buffer_capacity),
+                "epsilon_start": float(epsilon_start),
+                "epsilon_min": float(epsilon_min),
+                "epsilon_decay": float(epsilon_decay),
+                **env_run_config(env0),
+            },
         )
 
         # Save a sidecar config for reproducibility.
@@ -404,20 +444,20 @@ def train_qmix_value_expansion_fixed_wm(
 if __name__ == "__main__":
     repo_root = get_repo_root()
 
-    # Defaults: if weights are placed under `UAV-Jammer-RL/`, use them; otherwise fall back to latest in Draw/.
-    local_qmix = Path("mpdqn_qmix_weights.pth")
-    local_wm = Path("world_model_weights.pth")
-    default_qmix = str(local_qmix) if local_qmix.exists() else str(
-        _find_latest_weights(repo_root=repo_root, prefix="mpdqn_qmix_", filename="mpdqn_qmix_weights.pth")
-    )
-    default_wm = str(local_wm) if local_wm.exists() else str(
-        _find_latest_weights(repo_root=repo_root, prefix="world_model_rssm_", filename="world_model_weights.pth")
-    )
-
     parser = argparse.ArgumentParser(description="Train QMIX with Value Expansion using a frozen pretrained world model")
 
-    parser.add_argument("--qmix-weights", type=str, default=default_qmix)
-    parser.add_argument("--world-model-weights", type=str, default=default_wm)
+    parser.add_argument(
+        "--qmix-weights",
+        type=str,
+        default=None,
+        help="Optional QMIX checkpoint. If omitted, uses ./mpdqn_qmix_weights.pth or the latest under Draw/experiment-data when available.",
+    )
+    parser.add_argument(
+        "--world-model-weights",
+        type=str,
+        default=None,
+        help="World model checkpoint. If omitted, uses ./world_model_weights.pth or the latest under Draw/experiment-data.",
+    )
 
     parser.add_argument("--episodes", type=int, default=1500)
     parser.add_argument("--steps", type=int, default=None, help="Rollout steps per episode (default: env.yaml max_episode_steps)")
@@ -450,6 +490,37 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    qmix_weights = args.qmix_weights
+    if qmix_weights is None:
+        local_qmix = Path("mpdqn_qmix_weights.pth")
+        if local_qmix.exists():
+            qmix_weights = str(local_qmix)
+        else:
+            try:
+                qmix_weights = str(
+                    _find_latest_weights(
+                        repo_root=repo_root,
+                        prefix="mpdqn_qmix_",
+                        filename="mpdqn_qmix_weights.pth",
+                    )
+                )
+            except FileNotFoundError:
+                qmix_weights = None
+
+    world_model_weights = args.world_model_weights
+    if world_model_weights is None:
+        local_wm = Path("world_model_weights.pth")
+        if local_wm.exists():
+            world_model_weights = str(local_wm)
+        else:
+            world_model_weights = str(
+                _find_latest_weights(
+                    repo_root=repo_root,
+                    prefix="world_model_rssm_",
+                    filename="world_model_weights.pth",
+                )
+            )
+
     train_qmix_value_expansion_fixed_wm(
         n_episode=int(args.episodes),
         n_steps=args.steps,
@@ -466,8 +537,8 @@ if __name__ == "__main__":
         device=args.device,
         start_method=str(args.start_method),
         save_data=not bool(args.no_save),
-        qmix_weights=str(args.qmix_weights) if args.qmix_weights else None,
-        world_model_weights=str(args.world_model_weights),
+        qmix_weights=str(qmix_weights) if qmix_weights else None,
+        world_model_weights=str(world_model_weights),
         alpha_model=float(args.alpha_model),
         gamma=float(args.gamma),
         lam=float(args.lam),
@@ -479,4 +550,3 @@ if __name__ == "__main__":
         epsilon_decay=float(args.epsilon_decay),
         seed=int(args.seed),
     )
-

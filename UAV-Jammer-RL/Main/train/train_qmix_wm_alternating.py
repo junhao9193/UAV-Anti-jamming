@@ -29,7 +29,14 @@ import numpy as np
 from tqdm.auto import trange
 
 from envs import Environ
-from Main.common import SubprocVecEnv, get_repo_root, make_fixed_p_trans, resolve_episode_steps, save_training_data
+from Main.common import (
+    SubprocVecEnv,
+    env_run_config,
+    get_repo_root,
+    make_fixed_p_trans,
+    resolve_episode_steps,
+    save_training_data,
+)
 
 
 def _linear_ramp(t: int, *, t0: int, t1: int, v_max: float) -> float:
@@ -165,7 +172,12 @@ def train_qmix_wm_alternating(
     env0 = Environ()
     n_steps = resolve_episode_steps(env0, n_steps)
     p_trans_fixed = make_fixed_p_trans(env0)
-    vecenv = SubprocVecEnv(int(num_envs), p_trans=p_trans_fixed, start_method=str(start_method), seed=int(seed))
+    vecenv = SubprocVecEnv(
+        int(num_envs),
+        p_trans=p_trans_fixed,
+        start_method=str(start_method),
+        seed=int(seed),
+    )
 
     # --- QMIX ---
     qmix = MPDQNQMIXTrainer(
@@ -486,6 +498,49 @@ def train_qmix_wm_alternating(
         n_episode=int(total_episodes),
         n_steps=int(n_steps),
         trainer=qmix,
+        run_config={
+            "algorithm": "mpdqn_qmix_wm_alternating",
+            "seed": int(seed),
+            "num_envs": int(num_envs),
+            "batch_size": int(batch_size),
+            "buffer_capacity": int(buffer_capacity),
+            "learn_every": int(learn_every),
+            "updates_per_learn": int(updates_per_learn),
+            "lr_actor": float(lr_actor),
+            "lr_q": float(lr_q),
+            "lr_mixer": None if lr_mixer is None else float(lr_mixer),
+            "max_grad_norm": float(max_grad_norm),
+            "use_amp": bool(use_amp),
+            "device": str(device),
+            "start_method": str(start_method),
+            "qmix_weights": str(qmix_weights) if qmix_weights is not None else None,
+            "world_model_weights": str(world_model_weights) if world_model_weights is not None else None,
+            "qmix_block_episodes": int(qmix_block_episodes),
+            "wm_block_episodes": int(wm_block_episodes),
+            "alpha_model": float(alpha_model),
+            "gamma": float(gamma),
+            "lam": float(lam),
+            "rollout_k": int(rollout_k),
+            "seq_len": int(seq_len),
+            "wm_buffer_capacity": int(wm_buffer_capacity),
+            "wm_hidden_dim": int(wm_hidden_dim),
+            "wm_n_layers": int(wm_n_layers),
+            "wm_stochastic_dim": int(wm_stochastic_dim),
+            "wm_kl_beta": float(wm_kl_beta),
+            "wm_free_nats": float(wm_free_nats),
+            "wm_lr": float(wm_lr),
+            "wm_max_grad_norm": float(wm_max_grad_norm),
+            "wm_batch_size": int(wm_batch_size),
+            "wm_updates_per_learn": int(wm_updates_per_learn),
+            "wm_alpha_r": float(wm_alpha_r),
+            "wm_eta_vc": float(wm_eta_vc),
+            "wm_vc_warmup_ep": int(wm_vc_warmup_ep),
+            "wm_vc_ramp_end_ep": int(wm_vc_ramp_end_ep),
+            "epsilon_start": float(epsilon_start),
+            "epsilon_min": float(epsilon_min),
+            "epsilon_decay": float(epsilon_decay),
+            **env_run_config(env0),
+        },
     )
 
     # Save extra artifacts (WM weights + combined metrics) in the same experiment dir.
