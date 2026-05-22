@@ -1083,14 +1083,29 @@ class Environ:
         # `decomposition_action()` does not mutate the action container, so `deepcopy` is unnecessary
         # and can become a major overhead when running many env steps in parallel workers.
         self.decomposition_action(a)
+        # Capture the start-of-slot jammer (J_k_start) BEFORE act(). act() internally calls
+        # renew_jammer_channels_after_Rx() and then get_reward(), so by the time it returns
+        # self.jammer_channels reflects the post-Rx-boundary state, not what the agent decided
+        # against. The BCE label must be the start-of-slot jammer to match the predictor's
+        # intended semantic at action-selection time.
+        jammer_channels_current = [int(ch) for ch in list(self.jammer_channels)]
+        jammer_channels_current_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
+        jammer_channels_current_multi_hot[np.asarray(jammer_channels_current, dtype=np.int32)] = 1.0
         reward = self.act()
         state_next = self.get_state()  # 得到新的状态
         self.renew_jammer_channels_after_learn()
         self.episode_step += 1
         done = self.episode_step >= self.max_episode_steps
+        jammer_channels_next = [int(ch) for ch in list(self.jammer_channels)]
+        jammer_channels_next_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
+        jammer_channels_next_multi_hot[np.asarray(jammer_channels_next, dtype=np.int32)] = 1.0
         info = {
             "episode_step": int(self.episode_step),
             "max_episode_steps": int(self.max_episode_steps),
+            "jammer_channels_current": jammer_channels_current,
+            "jammer_channels_current_multi_hot": jammer_channels_current_multi_hot.tolist(),
+            "jammer_channels_next": jammer_channels_next,
+            "jammer_channels_next_multi_hot": jammer_channels_next_multi_hot.tolist(),
             "jammer_obs_history": [
                 sorted(int(ch) for ch in observed_set)
                 for observed_set in self._jammer_observed_channel_history

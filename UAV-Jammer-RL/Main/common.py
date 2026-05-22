@@ -270,6 +270,10 @@ def _save_model_weights(trainer: Any, data_dir: Path, algorithm: str) -> str:
                 "target_actor": agent.target_actor.state_dict(),
                 "target_q_net": agent.target_q_net.state_dict(),
             }
+            if hasattr(agent, "jammer_predictor"):
+                agent_state["jammer_predictor"] = agent.jammer_predictor.state_dict()
+            if hasattr(agent, "target_jammer_predictor"):
+                agent_state["target_jammer_predictor"] = agent.target_jammer_predictor.state_dict()
             checkpoint["agents"].append(agent_state)
 
         if agents:
@@ -279,6 +283,14 @@ def _save_model_weights(trainer: Any, data_dir: Path, algorithm: str) -> str:
                 "n_actions": first_agent.n_actions,
                 "param_dim": first_agent.param_dim,
             }
+            if hasattr(first_agent, "n_channel"):
+                checkpoint["agent_config"]["n_channel"] = int(first_agent.n_channel)
+            if hasattr(first_agent, "jammer_history_len"):
+                checkpoint["agent_config"]["jammer_history_len"] = int(first_agent.jammer_history_len)
+            if hasattr(first_agent, "jammer_pred_hidden_dim"):
+                checkpoint["agent_config"]["jammer_pred_hidden_dim"] = int(first_agent.jammer_pred_hidden_dim)
+            if hasattr(first_agent, "use_jammer_feature"):
+                checkpoint["agent_config"]["use_jammer_feature"] = bool(first_agent.use_jammer_feature)
 
         if hasattr(trainer, "mixer") and trainer.mixer is not None:
             mixer = trainer.mixer
