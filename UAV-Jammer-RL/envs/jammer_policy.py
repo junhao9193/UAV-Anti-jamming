@@ -101,10 +101,19 @@ def _reactive_transition_row(env: Any, idx: int) -> np.ndarray:
     if not observed_freq:
         return p
 
-    scores = np.asarray(
-        [sum(observed_freq.get(int(ch), 0.0) for ch in state) for state in env.all_jammer_states_list],
-        dtype=np.float64,
-    )
+    state_channel_counts = getattr(env, "_jammer_state_channel_counts", None)
+    if state_channel_counts is not None:
+        freq_vec = np.zeros(int(env.n_channel), dtype=np.float64)
+        for ch, freq in observed_freq.items():
+            ch = int(ch)
+            if 0 <= ch < int(env.n_channel):
+                freq_vec[ch] = float(freq)
+        scores = np.asarray(state_channel_counts, dtype=np.float64) @ freq_vec
+    else:
+        scores = np.asarray(
+            [sum(observed_freq.get(int(ch), 0.0) for ch in state) for state in env.all_jammer_states_list],
+            dtype=np.float64,
+        )
     w = p * np.exp(beta * scores)
     w_sum = float(np.sum(w))
     if np.isfinite(w_sum) and w_sum > 0.0:
@@ -125,7 +134,9 @@ def renew_jammer_channels_after_Rx(env: Any) -> None:
     if prev_dwell == curr_dwell - 1:
         # Detect whether the Rx interval crossed exactly one jammer dwell boundary.
         old_jammer_channels = tuple(env.jammer_channels)
-        idx = env.all_jammer_states_list.index(old_jammer_channels)
+        idx = getattr(env, "_jammer_state_to_index", {}).get(old_jammer_channels)
+        if idx is None:
+            idx = env.all_jammer_states_list.index(old_jammer_channels)
         p = _reactive_transition_row(env, idx)
         env.jammer_channels = _jammer_choices(env, env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
 
@@ -154,7 +165,10 @@ def renew_jammer_channels_after_learn(env: Any) -> None:
         _dwell_index(env.t_jammer - env.timestep, env.t_dwell)
         == _dwell_index(env.t_jammer, env.t_dwell) - 1
     ):  # 这里是什么意思
-        idx = env.all_jammer_states_list.index(tuple(env.jammer_channels))
+        jammer_channels = tuple(env.jammer_channels)
+        idx = getattr(env, "_jammer_state_to_index", {}).get(jammer_channels)
+        if idx is None:
+            idx = env.all_jammer_states_list.index(jammer_channels)
         p = _reactive_transition_row(env, idx)
         env.jammer_channels = _jammer_choices(env, env.all_jammer_states_list, weights=p.tolist(), k=1)[0]
 

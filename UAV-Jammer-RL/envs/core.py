@@ -324,6 +324,16 @@ class Environ:
         self.all_jammer_states_list = []
         self.jammer_state_dim = int(perm(self.n_channel, self.n_jammer)) # perm()全排列
         self.all_jammer_states_list.extend(list(permutations(self.channel_indexes, self.n_jammer))) # permutations给定一个数组集合，返回所有可能的排列。
+        self._jammer_state_to_index = {
+            tuple(int(ch) for ch in state): idx
+            for idx, state in enumerate(self.all_jammer_states_list)
+        }
+        self._jammer_state_channel_counts = np.zeros(
+            (int(self.jammer_state_dim), int(self.n_channel)),
+            dtype=np.float64,
+        )
+        for idx, state in enumerate(self.all_jammer_states_list):
+            self._jammer_state_channel_counts[idx, np.asarray(state, dtype=np.int32)] += 1.0
         
         self.observed_state_dim = int(comb(self.n_channel, self.n_jammer)) # comb返回从 n_channel 种可能性中选择n_jammer个无序结果的方式数量，无重复，也称为组合。
         self.all_observed_states_list.extend(list(combinations(self.channel_indexes, self.n_jammer)))
@@ -512,26 +522,18 @@ class Environ:
             return channels_observed
 
         else:
-            joint_state = []
             # CSI：每条链路在每个信道上的 CSI（路径损耗 + 信道固定差异/选择性 + 可选快衰落）。
             # 形状: (n_ch, n_des, n_channel)
-            csi = np.zeros([self.n_ch, self.n_des, self.n_channel], dtype=np.float32)
-
-            for i in range(self.n_ch):
-                for j in range(self.n_des):
-                    tra_id = self.uav_pairs[i][j][0]        # 发射机
-                    rec_id = self.uav_pairs[i][j][1]        # 接收机
-                    pathloss_vec = self.UAVchannels_loss_db[tra_id, rec_id, :].astype(np.float32)  # (n_channel,)
-                    csi_ij = (pathloss_vec - self.csi_pathloss_offset) / self.csi_pathloss_scale
-                    if self.csi_noise_std > 0.0:
-                        csi_ij = csi_ij + self._rng.normal(
-                            0.0,
-                            self.csi_noise_std,
-                            size=self.n_channel,
-                        ).astype(np.float32)
-                    if self.csi_clip:
-                        csi_ij = np.clip(csi_ij, -1.0, 1.0)
-                    csi[i, j, :] = csi_ij
+            tx_ids = self.uav_pairs[:, :, 0]
+            rx_ids = self.uav_pairs[:, :, 1]
+            csi = (
+                self.UAVchannels_loss_db[tx_ids, rx_ids, :].astype(np.float32)
+                - float(self.csi_pathloss_offset)
+            ) / float(self.csi_pathloss_scale)
+            if self.csi_noise_std > 0.0:
+                csi = csi + self._rng.normal(0.0, self.csi_noise_std, size=csi.shape).astype(np.float32)
+            if self.csi_clip:
+                csi = np.clip(csi, -1.0, 1.0)
 
             # 频谱感知：连续的“信道能量图”作为观测（不采样成 0/1）
             # z_i(c) = w_J * I[c in C^J] + w_U * sum_{k!=i} I[c in C^k] + noise
@@ -541,61 +543,52 @@ class Environ:
             else:
                 jammer_ch_list = self.jammer_channels
 
-            other_used_sets = [set(map(int, self.uav_channels[k].reshape(-1).tolist())) for k in range(self.n_ch)]
+            uav_used = np.zeros((self.n_ch, self.n_channel), dtype=np.float32)
+            uav_used[
+                np.arange(self.n_ch, dtype=np.int32)[:, None],
+                np.asarray(self.uav_channels, dtype=np.int32),
+            ] = 1.0
 
             # Range clipping: each cluster head only "sees" nearby jammers / nearby other cluster heads.
-            ch_tx_ids = np.asarray([int(self.uav_pairs[k][0][0]) for k in range(self.n_ch)], dtype=np.int32)
+            ch_tx_ids = np.asarray(self.uav_pairs[:, 0, 0], dtype=np.int32)
             ch_positions = np.asarray([self.uavs[idx].position for idx in ch_tx_ids], dtype=np.float32)  # (n_ch,3)
             jammer_positions = (
                 np.asarray([j.position for j in self.jammers], dtype=np.float32) if len(self.jammers) > 0 else None
             )
 
-            for i in range(self.n_ch):
-                z = np.zeros([self.n_channel], dtype=np.float32)
+            z = np.zeros((self.n_ch, self.n_channel), dtype=np.float32)
 
-                # jammer 占用（仅统计探测范围内的 jammer）
-                jammer_set_i = set()
-                if jammer_positions is None:
-                    jammer_set_i = set(map(int, jammer_ch_list))
-                else:
-                    d_j = np.linalg.norm(jammer_positions - ch_positions[i], axis=1)  # (n_jammer,)
-                    for jammer_idx, ch in enumerate(jammer_ch_list):
-                        if jammer_idx < d_j.shape[0] and float(d_j[jammer_idx]) <= float(self.sensing_jammer_range):
-                            jammer_set_i.add(int(ch))
+            # jammer 占用（仅统计探测范围内的 jammer）
+            jammer_ch_arr = np.asarray(jammer_ch_list, dtype=np.int32)
+            jammer_seen = np.zeros((self.n_ch, self.n_channel), dtype=bool)
+            if jammer_positions is None:
+                jammer_seen[:, jammer_ch_arr] = True
+            elif jammer_ch_arr.size > 0:
+                d_j = np.linalg.norm(ch_positions[:, None, :] - jammer_positions[None, :, :], axis=2)
+                visible_jammer = d_j <= float(self.sensing_jammer_range)
+                row_idx = np.repeat(np.arange(self.n_ch, dtype=np.int32), jammer_ch_arr.size)
+                ch_idx = np.tile(jammer_ch_arr, self.n_ch)
+                visible_flat = visible_jammer.reshape(-1)
+                jammer_seen[row_idx[visible_flat], ch_idx[visible_flat]] = True
+            z += jammer_seen.astype(np.float32) * float(self.sensing_w_jammer)
 
-                if jammer_set_i:
-                    z[np.asarray(list(jammer_set_i), dtype=np.int32)] += float(self.sensing_w_jammer)
+            # 其他簇头占用（按簇头计数，不按 link 计数）
+            d_ch = np.linalg.norm(ch_positions[:, None, :] - ch_positions[None, :, :], axis=2)
+            visible_ch = d_ch <= float(self.sensing_uav_range)
+            np.fill_diagonal(visible_ch, False)
+            z += (visible_ch.astype(np.float32) @ uav_used) * float(self.sensing_w_uav)
 
-                # 其他簇头占用（按簇头计数，不按 link 计数）
-                d_ch = np.linalg.norm(ch_positions - ch_positions[i], axis=1)  # (n_ch,)
-                for k in range(self.n_ch):
-                    if k == i:
-                        continue
-                    if float(d_ch[k]) > float(self.sensing_uav_range):
-                        continue
-                    used = other_used_sets[k]
-                    if used:
-                        z[np.asarray(list(used), dtype=np.int32)] += float(self.sensing_w_uav)
+            # 可选：感知噪声（默认 0，不引入随机性）
+            if self.sensing_noise_std > 0.0:
+                z += self._rng.normal(0.0, self.sensing_noise_std, size=z.shape).astype(np.float32)
 
-                # 可选：感知噪声（默认 0，不引入随机性）
-                if self.sensing_noise_std > 0.0:
-                    z += self._rng.normal(0.0, self.sensing_noise_std, size=self.n_channel).astype(np.float32)
+            mu = np.mean(z, axis=1, keepdims=True)
+            std = np.std(z, axis=1, keepdims=True)
+            z_norm = np.divide(z - mu, std + 1e-12, out=np.zeros_like(z, dtype=np.float32), where=std >= 1e-6)
+            channel_sensing = np.clip(z_norm, -1.0, 1.0).astype(np.float32)
 
-                mu = float(np.mean(z))
-                std = float(np.std(z))
-                if std < 1e-6:
-                    z_norm = np.zeros_like(z, dtype=np.float32)
-                else:
-                    z_norm = (z - mu) / (std + 1e-12)
-                channel_sensing = np.clip(z_norm, -1.0, 1.0).astype(np.float32)
-
-                # 观测 = [CSI(n_des*n_channel), 频谱感知(n_channel)]
-                obs_i = np.concatenate([
-                    csi[i].reshape(-1),         # CSI: (n_des*n_channel,)
-                    channel_sensing,           # 频谱感知: n_channel
-                ]).astype(np.float32)
-                joint_state.append(obs_i)
-            return joint_state
+            obs = np.concatenate([csi.reshape(self.n_ch, -1), channel_sensing], axis=1).astype(np.float32)
+            return [obs[i] for i in range(self.n_ch)]
 
     def compute_reward(self, i, j, other_channel_list, pairs):
         uav_uav_interference = 0.0   # interference from other UAV transmitters (linear mW)
@@ -672,47 +665,118 @@ class Environ:
 
         return time, suc
 
-    def get_reward(self):
-        uav_rewards = np.zeros([self.n_ch], dtype=float)
+    def _compute_link_delivery(self, receiver_idx, target_channel, uav_signal, uav_uav_interference, event_data):
+        boundaries = [0.0, float(self.t_Rx)]
+        for event_start, event_end, _ in event_data:
+            boundaries.append(event_start)
+            boundaries.append(event_end)
+        boundaries = sorted(set(boundaries))
 
+        remaining_data = float(self.data_size)
+        transmit_time = float(self.t_Rx)
+        time_eps = 1e-9
+        interference_scale = float(max(0.0, self.uav_interference_scale))
+
+        for segment_start, segment_end in zip(boundaries[:-1], boundaries[1:]):
+            duration = float(segment_end - segment_start)
+            if duration <= time_eps:
+                continue
+
+            jammer_interference = 0.0
+            for event_start, event_end, jammer_idx in event_data:
+                if event_start <= float(segment_start) + time_eps and event_end >= float(segment_end) - time_eps:
+                    jammer_interference += 10 ** (
+                        (
+                            self.jammer_power
+                            - self.Jammerchannels_loss_db[jammer_idx, receiver_idx, target_channel]
+                            + self.jammerAntGain
+                            + self.uavAntGain
+                            - self.uavNoiseFigure
+                        )
+                        / 10
+                    )
+
+            denom = interference_scale * float(uav_uav_interference) + float(jammer_interference) + float(self.sig2)
+            uav_rate = np.log2(1 + np.divide(uav_signal, denom))
+            uav_rate *= self.bandwidth
+            deliverable = float(uav_rate) * duration
+            if deliverable + time_eps >= remaining_data:
+                transmit_time = float(segment_start + remaining_data / float(uav_rate))
+                break
+            remaining_data -= deliverable
+
+        if transmit_time < self.t_Rx:
+            return transmit_time, 1
+        return float(self.t_Rx), -3
+
+    def get_reward(self):
         if not self.jammer_events:
             self.jammer_events = [
                 JammerEvent(jammer_idx=i, channel=int(self.jammer_channels[i]), t_start=0.0, t_end=float(self.t_Rx))
                 for i in range(self.n_jammer)
             ]
 
-        tra = 0
-        rec = 0
-        success_cnt = np.zeros([self.n_ch], dtype=np.float32)
-        
-        while tra < self.n_ch:
-            other_channel_list = []
-            pairs = []
-            for i in range(self.n_ch):
-                for j in range(self.n_des):
-                    if i==tra and j==rec:
-                        continue
-                    other_channel_list.append(self.uav_channels[i][j])      #排除自己通信信道的其他信道
-                    pairs.append([i, j])
+        n_links = int(self.n_ch * self.n_des)
+        pairs_flat = self.uav_pairs.reshape(n_links, 2)
+        tx_idx = pairs_flat[:, 0].astype(np.int32, copy=False)
+        rx_idx = pairs_flat[:, 1].astype(np.int32, copy=False)
+        channels = np.asarray(self.uav_channels, dtype=np.int32).reshape(n_links)
+        powers = np.asarray(self.uav_powers, dtype=np.float32).reshape(n_links)
+        jumps = np.asarray(self.uav_jump_count, dtype=np.float32).reshape(n_links)
 
-            tra_time, suc = self.compute_reward(tra, rec, other_channel_list, pairs)  # 传输时间
-            self.rew_suc += suc
-            if suc == 1:
-                success_cnt[tra] += 1.0
-            energy = 10 ** (self.uav_powers[tra][rec] / 10 - 3) * tra_time      # 能量奖励
-            self.rew_energy += energy
-            jump = self.uav_jump_count[tra][rec] # 当前通信链路的跳频开销
-            self.rew_jump += jump
-            # uav_rewards[tra] += (0.5 * energy - 0.5 * jump)
-            max_energy = 10 ** (self.uav_power_max / 10 - 3) * self.t_Rx + 1e-12
-            norm_energy = float(energy / max_energy)
-            uav_rewards[tra] += suc - (self.reward_energy_weight * norm_energy + self.reward_jump_weight * jump)
-            # print(energy, jump, suc)
-            # 保留两位小数
-            rec += 1
-            if rec == self.n_des:
-                tra += 1
-                rec = 0
+        signal_loss = self.UAVchannels_loss_db[tx_idx, rx_idx, channels]
+        uav_signal = 10 ** ((powers - signal_loss + 2 * self.uavAntGain - self.uavNoiseFigure) / 10)
+
+        loss_to_receivers = self.UAVchannels_loss_db[tx_idx[None, :], rx_idx[:, None], channels[:, None]]
+        received_from_links = 10 ** (
+            (powers[None, :] - loss_to_receivers + 2 * self.uavAntGain - self.uavNoiseFigure) / 10
+        )
+        same_channel = channels[None, :] == channels[:, None]
+        np.fill_diagonal(same_channel, False)
+        uav_uav_interference = np.sum(
+            np.where(same_channel, received_from_links, 0.0),
+            axis=1,
+            dtype=np.float64,
+        )
+
+        events_by_channel = [[] for _ in range(self.n_channel)]
+        for event in self.jammer_events:
+            if float(event.t_end) > float(event.t_start):
+                ch = int(event.channel)
+                if 0 <= ch < self.n_channel:
+                    events_by_channel[ch].append(
+                        (
+                            float(np.clip(event.t_start, 0.0, self.t_Rx)),
+                            float(np.clip(event.t_end, 0.0, self.t_Rx)),
+                            int(event.jammer_idx),
+                        )
+                    )
+
+        transmit_time = np.empty(n_links, dtype=np.float64)
+        suc_arr = np.empty(n_links, dtype=np.float32)
+        for link_idx in range(n_links):
+            tra_time, suc = self._compute_link_delivery(
+                receiver_idx=int(rx_idx[link_idx]),
+                target_channel=int(channels[link_idx]),
+                uav_signal=float(uav_signal[link_idx]),
+                uav_uav_interference=float(uav_uav_interference[link_idx]),
+                event_data=events_by_channel[int(channels[link_idx])],
+            )
+            transmit_time[link_idx] = float(tra_time)
+            suc_arr[link_idx] = float(suc)
+
+        energy = (10 ** (powers.astype(np.float64) / 10 - 3)) * transmit_time
+        self.rew_suc += float(np.sum(suc_arr, dtype=np.float64))
+        self.rew_energy += float(np.sum(energy, dtype=np.float64))
+        self.rew_jump += float(np.sum(jumps, dtype=np.float64))
+
+        max_energy = 10 ** (self.uav_power_max / 10 - 3) * self.t_Rx + 1e-12
+        norm_energy = energy / max_energy
+        link_rewards = suc_arr.astype(np.float64) - (
+            float(self.reward_energy_weight) * norm_energy + float(self.reward_jump_weight) * jumps
+        )
+        uav_rewards = np.sum(link_rewards.reshape(self.n_ch, self.n_des), axis=1)
+        success_cnt = np.sum((suc_arr.reshape(self.n_ch, self.n_des) == 1.0), axis=1).astype(np.float32)
 
         # Fairness: penalize the whole team if any cluster falls below a minimum success rate.
         if float(self.fairness_weight) > 0.0 and float(self.fairness_min_success_rate) > 0.0:
@@ -1023,8 +1087,26 @@ class Environ:
         # 分解动作值的操作，由簇头到每个选择的通信信道数
 
     def decomposition_action(self, action):
-        for i in range(self.n_ch):
-            discrete_action, all_action_params = action[i]
+        if (
+            isinstance(action, tuple)
+            and len(action) == 2
+            and isinstance(action[0], np.ndarray)
+            and isinstance(action[1], np.ndarray)
+        ):
+            action_discrete_arr = np.asarray(action[0], dtype=np.int64).reshape(-1)
+            action_params_arr = np.asarray(action[1], dtype=np.float32)
+            if action_discrete_arr.size != self.n_ch:
+                raise ValueError(f"Invalid action_discrete size: got {action_discrete_arr.size}, expected {self.n_ch}")
+            if action_params_arr.shape != (self.n_ch, self.total_param_dim):
+                raise ValueError(
+                    "Invalid action_params shape: got "
+                    f"{action_params_arr.shape}, expected ({self.n_ch}, {self.total_param_dim})"
+                )
+            action_iter = ((int(action_discrete_arr[i]), action_params_arr[i]) for i in range(self.n_ch))
+        else:
+            action_iter = (action[i] for i in range(self.n_ch))
+
+        for i, (discrete_action, all_action_params) in enumerate(action_iter):
             discrete_action = int(discrete_action)
 
             all_action_params = np.asarray(all_action_params, dtype=np.float32).reshape(-1)
@@ -1075,7 +1157,7 @@ class Environ:
         state = self.get_state()
         return state
 
-    def step(self, a):
+    def step(self, a, return_info: bool = True):
         if not self._episode_initialized:
             raise RuntimeError("Environment episode state is not initialized. Call reset() before step().")
 
@@ -1088,32 +1170,36 @@ class Environ:
         # self.jammer_channels reflects the post-Rx-boundary state, not what the agent decided
         # against. The BCE label must be the start-of-slot jammer to match the predictor's
         # intended semantic at action-selection time.
-        jammer_channels_current = [int(ch) for ch in list(self.jammer_channels)]
-        jammer_channels_current_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
-        jammer_channels_current_multi_hot[np.asarray(jammer_channels_current, dtype=np.int32)] = 1.0
+        if return_info:
+            jammer_channels_current = [int(ch) for ch in list(self.jammer_channels)]
+            jammer_channels_current_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
+            jammer_channels_current_multi_hot[np.asarray(jammer_channels_current, dtype=np.int32)] = 1.0
         reward = self.act()
         state_next = self.get_state()  # 得到新的状态
         self.renew_jammer_channels_after_learn()
         self.episode_step += 1
         done = self.episode_step >= self.max_episode_steps
-        jammer_channels_next = [int(ch) for ch in list(self.jammer_channels)]
-        jammer_channels_next_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
-        jammer_channels_next_multi_hot[np.asarray(jammer_channels_next, dtype=np.int32)] = 1.0
-        info = {
-            "episode_step": int(self.episode_step),
-            "max_episode_steps": int(self.max_episode_steps),
-            "jammer_channels_current": jammer_channels_current,
-            "jammer_channels_current_multi_hot": jammer_channels_current_multi_hot.tolist(),
-            "jammer_channels_next": jammer_channels_next,
-            "jammer_channels_next_multi_hot": jammer_channels_next_multi_hot.tolist(),
-            "jammer_obs_history": [
-                sorted(int(ch) for ch in observed_set)
-                for observed_set in self._jammer_observed_channel_history
-            ],
-        }
-        if done:
-            info["terminal_reason"] = "time_limit"
-            info["TimeLimit.truncated"] = True
+        if return_info:
+            jammer_channels_next = [int(ch) for ch in list(self.jammer_channels)]
+            jammer_channels_next_multi_hot = np.zeros([self.n_channel], dtype=np.float32)
+            jammer_channels_next_multi_hot[np.asarray(jammer_channels_next, dtype=np.int32)] = 1.0
+            info = {
+                "episode_step": int(self.episode_step),
+                "max_episode_steps": int(self.max_episode_steps),
+                "jammer_channels_current": jammer_channels_current,
+                "jammer_channels_current_multi_hot": jammer_channels_current_multi_hot.tolist(),
+                "jammer_channels_next": jammer_channels_next,
+                "jammer_channels_next_multi_hot": jammer_channels_next_multi_hot.tolist(),
+                "jammer_obs_history": [
+                    sorted(int(ch) for ch in observed_set)
+                    for observed_set in self._jammer_observed_channel_history
+                ],
+            }
+            if done:
+                info["terminal_reason"] = "time_limit"
+                info["TimeLimit.truncated"] = True
+        else:
+            info = {}
         return state_next, reward, done, info
 
     def smooth(self, data, sm=1):

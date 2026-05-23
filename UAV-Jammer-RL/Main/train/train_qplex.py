@@ -35,6 +35,7 @@ def train_mpdqn_qplex(
     hypernet_hidden_dim: int = 64,
     n_heads: int = 4,
     max_grad_norm: float = 10.0,
+    loss_log_every: int = 1,
     use_amp: bool = True,
     device: str | None = None,
     save_data: bool = True,
@@ -69,6 +70,7 @@ def train_mpdqn_qplex(
         p_trans=p_trans_fixed,
         start_method=str(start_method),
         seed=int(seed),
+        include_info=False,
     )
 
     trainer = MPDQNQPLEXTrainer(
@@ -87,6 +89,7 @@ def train_mpdqn_qplex(
         n_heads=int(n_heads),
         use_amp=use_amp,
         max_grad_norm=float(max_grad_norm),
+        loss_log_interval=int(loss_log_every),
         device=device,
     )
 
@@ -138,7 +141,7 @@ def train_mpdqn_qplex(
                 if (step + 1) % int(max(1, learn_every)) == 0:
                     for _ in range(int(max(1, updates_per_learn))):
                         loss_info = trainer.train_step()
-                        if loss_info is not None:
+                        if loss_info is not None and loss_info.get("loss_q") is not None:
                             loss_q_sum += float(loss_info["loss_q"])
                             loss_actor_sum += float(loss_info["loss_actor"])
                             loss_count += 1
@@ -228,6 +231,7 @@ def train_mpdqn_qplex(
                 "epsilon_min": float(epsilon_min),
                 "epsilon_decay": float(epsilon_decay),
                 "max_grad_norm": float(max_grad_norm),
+                "loss_log_every": int(loss_log_every),
                 "use_amp": bool(use_amp),
                 "device": str(device),
                 "start_method": str(start_method),
@@ -259,6 +263,7 @@ if __name__ == "__main__":
     parser.add_argument("--hypernet-hidden-dim", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
+    parser.add_argument("--loss-log-every", type=int, default=1, help="0 disables per-update loss .item() logging")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
     parser.add_argument("--seed", type=int, default=0)
@@ -284,6 +289,7 @@ if __name__ == "__main__":
         hypernet_hidden_dim=int(args.hypernet_hidden_dim),
         n_heads=int(args.n_heads),
         max_grad_norm=float(args.max_grad_norm),
+        loss_log_every=int(args.loss_log_every),
         use_amp=not bool(args.no_amp),
         device=args.device,
         save_data=not bool(args.no_save),

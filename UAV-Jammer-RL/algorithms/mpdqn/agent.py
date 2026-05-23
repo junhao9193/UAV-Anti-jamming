@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import amp as torch_amp
 
 from algorithms.mpdqn.model import MPDQNActor, MPDQNQNetwork
+from algorithms.mpdqn.profiling import profile_section, should_log_loss
 from algorithms.mpdqn.replay_buffer import MPDQNReplayBuffer
 
 class MPDQNAgent:
@@ -30,6 +31,7 @@ class MPDQNAgent:
         target_update_interval: int = 200,
         use_amp: bool = False,
         max_grad_norm: float = 10.0,
+        loss_log_interval: int = 1,
         device: Optional[str] = None,
     ):
         self.state_dim = int(state_dim)
@@ -49,6 +51,8 @@ class MPDQNAgent:
         self.use_amp = bool(use_amp) and (self.device.type == "cuda")
         self.scaler = torch_amp.GradScaler("cuda", enabled=self.use_amp)
         self.max_grad_norm = float(max_grad_norm)
+        self.loss_log_interval = int(loss_log_interval)
+        self.profiler = None
 
         self.actor = MPDQNActor(self.state_dim, self.n_actions, self.param_dim).to(self.device)
         self.q_net = MPDQNQNetwork(self.state_dim, self.n_actions, self.param_dim).to(self.device)
@@ -133,14 +137,16 @@ class MPDQNAgent:
         if len(self.buffer) < self.batch_size:
             return None
 
-        batch = self.buffer.sample(self.batch_size)
+        with profile_section(self, "agent.sample_batch"):
+            batch = self.buffer.sample(self.batch_size)
 
-        state = torch.from_numpy(batch["state"]).to(self.device)
-        action_discrete = torch.from_numpy(batch["action_discrete"]).long().to(self.device).view(-1, 1)
-        action_params = torch.from_numpy(batch["action_params"]).to(self.device).view(-1, self.n_actions, self.param_dim)
-        reward = torch.from_numpy(batch["reward"]).to(self.device).view(-1, 1)
-        next_state = torch.from_numpy(batch["next_state"]).to(self.device)
-        done = torch.from_numpy(batch["done"]).to(self.device).view(-1, 1)
+        with profile_section(self, "agent.cpu_to_gpu"):
+            state = torch.from_numpy(batch["state"]).to(self.device)
+            action_discrete = torch.from_numpy(batch["action_discrete"]).long().to(self.device).view(-1, 1)
+            action_params = torch.from_numpy(batch["action_params"]).to(self.device).view(-1, self.n_actions, self.param_dim)
+            reward = torch.from_numpy(batch["reward"]).to(self.device).view(-1, 1)
+            next_state = torch.from_numpy(batch["next_state"]).to(self.device)
+            done = torch.from_numpy(batch["done"]).to(self.device).view(-1, 1)
 
         return self.train_step_from_tensors(
             state=state,
@@ -194,48 +200,59 @@ class MPDQNAgent:
             return torch_amp.autocast("cuda", enabled=self.use_amp)
 
         # --- Q update (Double DQN + MP-DQN multi-pass) ---
-        self.q_opt.zero_grad(set_to_none=True)
-        with _autocast():
-            q_all = self.q_net(state, action_params)
-            q_sa = q_all.gather(1, action_discrete)
+        with profile_section(self, "agent.critic_zero_grad"):
+            self.q_opt.zero_grad(set_to_none=True)
+        with profile_section(self, "agent.critic_forward"):
+            with _autocast():
+                q_all = self.q_net(state, action_params)
+                q_sa = q_all.gather(1, action_discrete)
 
-            with torch.no_grad():
-                next_params_eval = self.actor(next_state)
-                next_q_eval = self.q_net(next_state, next_params_eval)
-                next_action = torch.argmax(next_q_eval, dim=1, keepdim=True)
+                with torch.no_grad():
+                    next_params_eval = self.actor(next_state)
+                    next_q_eval = self.q_net(next_state, next_params_eval)
+                    next_action = torch.argmax(next_q_eval, dim=1, keepdim=True)
 
-                next_params_target = self.target_actor(next_state)
-                next_q_target_all = self.target_q_net(next_state, next_params_target)
-                next_q_target = next_q_target_all.gather(1, next_action)
+                    next_params_target = self.target_actor(next_state)
+                    next_q_target_all = self.target_q_net(next_state, next_params_target)
+                    next_q_target = next_q_target_all.gather(1, next_action)
 
-                td_target = reward + (1.0 - done) * self.gamma * next_q_target
+                    td_target = reward + (1.0 - done) * self.gamma * next_q_target
 
-            loss_q = F.mse_loss(q_sa, td_target)
+                loss_q = F.mse_loss(q_sa, td_target)
 
         if not torch.isfinite(loss_q):
             return {"loss_q": float("nan"), "loss_actor": float("nan"), "skipped": 1}
 
         if self.use_amp:
-            self.scaler.scale(loss_q).backward()
+            with profile_section(self, "agent.critic_backward"):
+                self.scaler.scale(loss_q).backward()
             if self.max_grad_norm > 0.0:
-                self.scaler.unscale_(self.q_opt)
-                torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.max_grad_norm)
-            self.scaler.step(self.q_opt)
+                with profile_section(self, "agent.critic_clip_grad"):
+                    self.scaler.unscale_(self.q_opt)
+                    torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.max_grad_norm)
+            with profile_section(self, "agent.critic_optimizer_step"):
+                self.scaler.step(self.q_opt)
         else:
-            loss_q.backward()
+            with profile_section(self, "agent.critic_backward"):
+                loss_q.backward()
             if self.max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.max_grad_norm)
-            self.q_opt.step()
+                with profile_section(self, "agent.critic_clip_grad"):
+                    torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.max_grad_norm)
+            with profile_section(self, "agent.critic_optimizer_step"):
+                self.q_opt.step()
 
         # --- Actor update ---
-        for p in self.q_net.parameters():
-            p.requires_grad = False
+        with profile_section(self, "agent.freeze_critic"):
+            for p in self.q_net.parameters():
+                p.requires_grad = False
 
-        self.actor_opt.zero_grad(set_to_none=True)
-        with _autocast():
-            params_pred = self.actor(state)
-            q_pred = self.q_net(state, params_pred)
-            loss_actor = -q_pred.mean()
+        with profile_section(self, "agent.actor_zero_grad"):
+            self.actor_opt.zero_grad(set_to_none=True)
+        with profile_section(self, "agent.actor_forward"):
+            with _autocast():
+                params_pred = self.actor(state)
+                q_pred = self.q_net(state, params_pred)
+                loss_actor = -q_pred.mean()
 
         if not torch.isfinite(loss_actor):
             for p in self.q_net.parameters():
@@ -247,30 +264,46 @@ class MPDQNAgent:
             return {"loss_q": float(loss_q.item()), "loss_actor": float("nan"), "skipped": 1}
 
         if self.use_amp:
-            self.scaler.scale(loss_actor).backward()
+            with profile_section(self, "agent.actor_backward"):
+                self.scaler.scale(loss_actor).backward()
             if self.max_grad_norm > 0.0:
-                self.scaler.unscale_(self.actor_opt)
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            self.scaler.step(self.actor_opt)
-            self.scaler.update()
+                with profile_section(self, "agent.actor_clip_grad"):
+                    self.scaler.unscale_(self.actor_opt)
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            with profile_section(self, "agent.actor_optimizer_step"):
+                self.scaler.step(self.actor_opt)
+            with profile_section(self, "agent.scaler_update"):
+                self.scaler.update()
         else:
-            loss_actor.backward()
+            with profile_section(self, "agent.actor_backward"):
+                loss_actor.backward()
             if self.max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            self.actor_opt.step()
+                with profile_section(self, "agent.actor_clip_grad"):
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            with profile_section(self, "agent.actor_optimizer_step"):
+                self.actor_opt.step()
 
-        for p in self.q_net.parameters():
-            p.requires_grad = True
+        with profile_section(self, "agent.restore_critic_grad"):
+            for p in self.q_net.parameters():
+                p.requires_grad = True
 
         # --- Target updates ---
         self.learn_steps += 1
         if self.learn_steps % self.target_update_interval == 0:
-            self.target_actor.load_state_dict(self.actor.state_dict())
-            self.target_q_net.load_state_dict(self.q_net.state_dict())
+            with profile_section(self, "agent.target_update"):
+                self.target_actor.load_state_dict(self.actor.state_dict())
+                self.target_q_net.load_state_dict(self.q_net.state_dict())
+
+        loss_q_value = None
+        loss_actor_value = None
+        if should_log_loss(self):
+            with profile_section(self, "agent.loss_item"):
+                loss_q_value = float(loss_q.item())
+                loss_actor_value = float(loss_actor.item())
 
         return {
-            "loss_q": float(loss_q.item()),
-            "loss_actor": float(loss_actor.item()),
+            "loss_q": loss_q_value,
+            "loss_actor": loss_actor_value,
         }
 
 

@@ -30,6 +30,7 @@ def train_mpdqn_qmix(
     lr_q: float = 1e-3,
     lr_mixer: float | None = None,
     max_grad_norm: float = 10.0,
+    loss_log_every: int = 1,
     use_amp: bool = True,
     device: str | None = None,
     save_data: bool = True,
@@ -67,6 +68,7 @@ def train_mpdqn_qmix(
         p_trans=p_trans_fixed,
         start_method=str(start_method),
         seed=int(seed),
+        include_info=False,
     )
 
     trainer = MPDQNQMIXTrainer(
@@ -82,6 +84,7 @@ def train_mpdqn_qmix(
         lr_mixer=(float(lr_mixer) if lr_mixer is not None else None),
         use_amp=use_amp,
         max_grad_norm=float(max_grad_norm),
+        loss_log_interval=int(loss_log_every),
         device=device,
     )
 
@@ -112,29 +115,24 @@ def train_mpdqn_qmix(
             steps_done = 0
 
             for step in range(int(n_steps)):
-                action_discrete_all = np.zeros((n_envs, n_agents), dtype=np.int32)
-                action_params_all = np.zeros((n_envs, n_agents, int(env0.total_param_dim)), dtype=np.float32)
+                if hasattr(trainer, "select_action_batch_all"):
+                    action_discrete_all, action_params_all = trainer.select_action_batch_all(states, epsilon)
+                else:
+                    action_discrete_all = np.zeros((n_envs, n_agents), dtype=np.int32)
+                    action_params_all = np.zeros((n_envs, n_agents, int(env0.total_param_dim)), dtype=np.float32)
 
-                for i in range(n_agents):
-                    ad, ap = trainer.agents[i].select_action_batch(states[:, i, :], epsilon)
-                    action_discrete_all[:, i] = ad
-                    action_params_all[:, i, :] = ap
-
-                actions = [
-                    [
-                        (int(action_discrete_all[e, i]), action_params_all[e, i, :])
-                        for i in range(n_agents)
-                    ]
-                    for e in range(n_envs)
-                ]
+                    for i in range(n_agents):
+                        ad, ap = trainer.agents[i].select_action_batch(states[:, i, :], epsilon)
+                        action_discrete_all[:, i] = ad
+                        action_params_all[:, i, :] = ap
 
                 # Overlap: start env stepping, then train on GPU while workers simulate.
-                vecenv.step_async(actions)
+                vecenv.step_async((action_discrete_all, action_params_all))
 
                 if (step + 1) % int(max(1, learn_every)) == 0:
                     for _ in range(int(max(1, updates_per_learn))):
                         loss_info = trainer.train_step()
-                        if loss_info is not None:
+                        if loss_info is not None and loss_info.get("loss_q") is not None:
                             loss_q_sum += float(loss_info["loss_q"])
                             loss_actor_sum += float(loss_info["loss_actor"])
                             loss_count += 1
@@ -142,14 +140,31 @@ def train_mpdqn_qmix(
                 next_states, rewards, dones, infos = vecenv.step_wait()  # next_states:(E,N,S), rewards:(E,N)
 
                 is_last_step = (step == int(n_steps) - 1)
-                for e in range(n_envs):
-                    trainer.store_transition(
-                        states=states[e],
-                        actions=actions[e],
-                        rewards=np.asarray(rewards[e], dtype=np.float32),
-                        next_states=next_states[e],
-                        done=bool(dones[e]) or is_last_step,
+                if hasattr(trainer, "store_transition_batch"):
+                    trainer.store_transition_batch(
+                        states=states,
+                        action_discrete=action_discrete_all,
+                        action_params=action_params_all,
+                        rewards=rewards,
+                        next_states=next_states,
+                        dones=np.asarray(dones, dtype=np.bool_) | bool(is_last_step),
                     )
+                else:
+                    actions = [
+                        [
+                            (int(action_discrete_all[e, i]), action_params_all[e, i, :])
+                            for i in range(n_agents)
+                        ]
+                        for e in range(n_envs)
+                    ]
+                    for e in range(n_envs):
+                        trainer.store_transition(
+                            states=states[e],
+                            actions=actions[e],
+                            rewards=np.asarray(rewards[e], dtype=np.float32),
+                            next_states=next_states[e],
+                            done=bool(dones[e]) or is_last_step,
+                        )
 
                 states = next_states
                 episode_reward += float(np.mean(rewards))
@@ -220,6 +235,7 @@ def train_mpdqn_qmix(
                 "epsilon_min": float(epsilon_min),
                 "epsilon_decay": float(epsilon_decay),
                 "max_grad_norm": float(max_grad_norm),
+                "loss_log_every": int(loss_log_every),
                 "use_amp": bool(use_amp),
                 "device": str(device),
                 "start_method": str(start_method),
@@ -248,6 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr-q", type=float, default=1e-3)
     parser.add_argument("--lr-mixer", type=float, default=None)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
+    parser.add_argument("--loss-log-every", type=int, default=1, help="0 disables per-update loss .item() logging")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--start-method", type=str, default="spawn", help="spawn|fork|forkserver")
     parser.add_argument("--seed", type=int, default=0)
@@ -270,6 +287,7 @@ if __name__ == "__main__":
         lr_q=float(args.lr_q),
         lr_mixer=args.lr_mixer,
         max_grad_norm=float(args.max_grad_norm),
+        loss_log_every=int(args.loss_log_every),
         use_amp=not bool(args.no_amp),
         device=args.device,
         save_data=not bool(args.no_save),

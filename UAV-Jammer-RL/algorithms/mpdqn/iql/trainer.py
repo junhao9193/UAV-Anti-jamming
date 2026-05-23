@@ -5,6 +5,7 @@ import torch
 
 from algorithms.mpdqn.agent import MPDQNAgent
 from algorithms.mpdqn.iql.joint_replay_buffer import MPDQNJointIQLReplayBuffer
+from algorithms.mpdqn.profiling import profile_section, set_profiler
 
 
 class MPDQNJointIQLTrainer:
@@ -33,6 +34,7 @@ class MPDQNJointIQLTrainer:
         target_update_interval: int = 200,
         use_amp: bool = False,
         max_grad_norm: float = 10.0,
+        loss_log_interval: int = 1,
         device: Optional[str] = None,
     ):
         self.n_agents = int(n_agents)
@@ -58,6 +60,7 @@ class MPDQNJointIQLTrainer:
                 target_update_interval=int(target_update_interval),
                 use_amp=bool(use_amp),
                 max_grad_norm=float(max_grad_norm),
+                loss_log_interval=int(loss_log_interval),
                 device=str(self.device),
             )
             for _ in range(self.n_agents)
@@ -65,6 +68,11 @@ class MPDQNJointIQLTrainer:
 
         self.batch_size = int(batch_size)
         self.buffer = MPDQNJointIQLReplayBuffer(capacity=int(buffer_capacity))
+        self.loss_log_interval = int(loss_log_interval)
+        self.profiler = None
+
+    def set_profiler(self, profiler) -> None:
+        set_profiler(self, profiler)
 
     def store_transition(
         self,
@@ -98,14 +106,16 @@ class MPDQNJointIQLTrainer:
         if len(self.buffer) < self.batch_size:
             return None
 
-        batch = self.buffer.sample(self.batch_size)
+        with profile_section(self, "sample_batch"):
+            batch = self.buffer.sample(self.batch_size)
 
-        state = torch.from_numpy(batch["state"]).to(self.device)  # (B,N,S)
-        action_discrete = torch.from_numpy(batch["action_discrete"]).long().to(self.device)  # (B,N)
-        action_params = torch.from_numpy(batch["action_params"]).to(self.device)  # (B,N,A*P)
-        reward = torch.from_numpy(batch["reward"]).to(self.device)  # (B,N)
-        next_state = torch.from_numpy(batch["next_state"]).to(self.device)  # (B,N,S)
-        done = torch.from_numpy(batch["done"]).to(self.device).view(-1, 1)  # (B,1)
+        with profile_section(self, "cpu_to_gpu"):
+            state = torch.from_numpy(batch["state"]).to(self.device)  # (B,N,S)
+            action_discrete = torch.from_numpy(batch["action_discrete"]).long().to(self.device)  # (B,N)
+            action_params = torch.from_numpy(batch["action_params"]).to(self.device)  # (B,N,A*P)
+            reward = torch.from_numpy(batch["reward"]).to(self.device)  # (B,N)
+            next_state = torch.from_numpy(batch["next_state"]).to(self.device)  # (B,N,S)
+            done = torch.from_numpy(batch["done"]).to(self.device).view(-1, 1)  # (B,1)
 
         loss_q_list = []
         loss_a_list = []
@@ -131,15 +141,17 @@ class MPDQNJointIQLTrainer:
             if int(out.get("skipped", 0)) > 0:
                 skipped += 1
                 continue
-            loss_q_list.append(float(out["loss_q"]))
-            loss_a_list.append(float(out["loss_actor"]))
+            if out.get("loss_q") is not None:
+                loss_q_list.append(float(out["loss_q"]))
+            if out.get("loss_actor") is not None:
+                loss_a_list.append(float(out["loss_actor"]))
 
         if not loss_q_list:
-            return {"loss_q": float("nan"), "loss_actor": float("nan"), "skipped": skipped}
+            return {"loss_q": None, "loss_actor": None, "skipped": skipped}
 
         return {
             "loss_q": float(np.mean(loss_q_list)),
-            "loss_actor": float(np.mean(loss_a_list)),
+            "loss_actor": float(np.mean(loss_a_list)) if loss_a_list else None,
             "skipped": skipped,
         }
 
