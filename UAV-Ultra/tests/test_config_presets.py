@@ -152,7 +152,7 @@ def test_callback_override_replaces_preset_list_and_revalidates_dependencies():
     with pytest.raises(ValueError, match="requires 'value_expansion'"):
         run_training(
             "qmix",
-            preset="qmix_value_expansion_baseline",
+            preset="qmix_wm_concurrent_baseline",
             algo_overrides={"callbacks": ["wm_concurrent"]},
             no_save=True,
         )

@@ -1,5 +1,5 @@
 algorithm: qmix
-description: "5090 tuned preset: train_qmix_wm_alternating_jammer_prediction.py"
+description: "qmix + WM concurrent: Q and WM trained jointly each learn step (baseline train_qmix_value_expansion.py). VE-style TD target is shared with wm_block path; the distinction here is the WM update schedule."
 source: "UAV-Ultra/docs/5090-服务器后台训练命令.md"
 env: {}
 algo:
@@ -20,7 +20,7 @@ algo:
   lr_actor: 0.001
   lr_q: 0.001
   max_grad_norm: 10.0
-  epsilon_start: 0.2
+  epsilon_start: 1.0
   epsilon_min: 0.01
   epsilon_decay: 0.995
   lr_mixer: 0.001
@@ -29,8 +29,7 @@ algo:
   value_target_clip: 1000.0
   callbacks:
     - value_expansion
-    - wm_block_alternating
-    - jammer_prediction
+    - wm_concurrent
   value_expansion_alpha_model: 0.01
   value_expansion_seq_len: 8
   value_expansion_td_lambda: 0.8
@@ -45,7 +44,7 @@ algo:
   wm_updates_per_learn: 2
   wm_vc_eta_max: 0.2
   wm_vc_warmup_ep: 300
-  wm_vc_ramp_end_ep: 800
+  wm_vc_ramp_end_ep: 1000
   wm_buffer_capacity: 500000
   wm_hidden_dim: 256
   wm_n_layers: 1

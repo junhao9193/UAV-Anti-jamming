@@ -1,19 +1,19 @@
 algorithm: qplex
-description: "Baseline equivalent: train_qplex.py"
-source: "Main/train/train_qplex.py@2360ab92"
+description: "5090 tuned preset: train_qplex.py"
+source: "UAV-Ultra/docs/5090-服务器后台训练命令.md"
 env: {}
 algo:
-  n_episode: 1500
+  n_episode: 3000
   n_steps: null
-  num_envs: 32
-  batch_size: 256
+  num_envs: 16
+  batch_size: 512
   buffer_capacity: 200000
   learn_every: 4
   updates_per_learn: 1
   seed: 0
   device: auto
   use_amp: true
-  start_method: spawn
+  start_method: fork
   loss_log_every: 1
   gamma: 0.99
   target_update_interval: 200
@@ -23,7 +23,7 @@ algo:
   epsilon_start: 1.0
   epsilon_min: 0.01
   epsilon_decay: 0.995
-  lr_mixer: null
+  lr_mixer: 0.001
   mixing_hidden_dim: 32
   hypernet_hidden_dim: 64
   value_target_clip: 1000.0

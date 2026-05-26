@@ -13,6 +13,10 @@ value_expansion_alpha_model: 0.5
 value_expansion_seq_len: 4
 value_expansion_td_lambda: 0.8
 value_expansion_rollout_k: 4
+value_expansion_model_warmup_ep: 200
+value_expansion_ramp_start_ep: 300
+value_expansion_ramp_end_ep: 500
+value_expansion_alpha_model_max: 0.01
 # Stage 7：WM concurrent / block-alternating + L_VC（默认对齐 baseline train_qmix_wm_alternating.py）
 wm_block_qmix_episodes: 50
 wm_block_wm_episodes: 50
@@ -41,3 +45,7 @@ jammer_warmup_episodes: 200
 use_jammer_feature: true
 critic_stable_tau: 0.005
 critic_stable_lr_scale: 1.0
+critic_stable_lr_decay_enabled: false
+critic_stable_lr_decay_start_ep: 1500
+critic_stable_lr_decay_end_ep: 3000
+critic_stable_lr_decay_min: 0.1

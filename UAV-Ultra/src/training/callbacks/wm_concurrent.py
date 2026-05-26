@@ -73,6 +73,7 @@ class WMConcurrentCallback(TrainingCallback):
         shared: dict[str, Any] | None = None,
         seq_len: int = 4,
         lr: float = 1e-3,
+        curriculum_active: bool = False,
     ):
         self.env_cfg = env_cfg
         self.algo_cfg = algo_cfg
@@ -80,6 +81,7 @@ class WMConcurrentCallback(TrainingCallback):
         self.seq_len = int(getattr(algo_cfg, "value_expansion_seq_len", seq_len))
         self.lr = float(getattr(algo_cfg, "wm_lr", lr))
         self.wm_max_grad_norm = float(getattr(algo_cfg, "wm_max_grad_norm", 0.0))
+        self.curriculum_active = bool(curriculum_active)
         self.base_param_dim = int(specs.total_param_dim(env_cfg))
         # Stage 7：从 algo_cfg 取 WM batch + ramp 参数；callback 单测时 algo_cfg 可能不带这些
         # 字段，提供 baseline 默认值兜底。
@@ -88,6 +90,15 @@ class WMConcurrentCallback(TrainingCallback):
         self.vc_eta_max = float(getattr(algo_cfg, "wm_vc_eta_max", 0.0))
         self.vc_warmup_ep = int(getattr(algo_cfg, "wm_vc_warmup_ep", 0))
         self.vc_ramp_end_ep = int(getattr(algo_cfg, "wm_vc_ramp_end_ep", 0))
+        self.value_expansion_model_warmup_ep = int(
+            getattr(algo_cfg, "value_expansion_model_warmup_ep", 200)
+        )
+        self.value_expansion_ramp_start_ep = int(
+            getattr(algo_cfg, "value_expansion_ramp_start_ep", 300)
+        )
+        self.value_expansion_ramp_end_ep = int(
+            getattr(algo_cfg, "value_expansion_ramp_end_ep", 500)
+        )
         self.last_wm_result: list[dict[str, float]] = []
 
     # ------------------------------------------------------------------
@@ -254,6 +265,21 @@ class WMConcurrentCallback(TrainingCallback):
     # ------------------------------------------------------------------
     # WM update
     # ------------------------------------------------------------------
+    def _eta_for_episode(self, episode: int) -> float:
+        if self.curriculum_active:
+            return _vc_eta(
+                episode,
+                warmup_ep=self.value_expansion_ramp_start_ep,
+                ramp_end_ep=self.value_expansion_ramp_end_ep,
+                v_max=self.vc_eta_max,
+            )
+        return _vc_eta(
+            episode,
+            warmup_ep=self.vc_warmup_ep,
+            ramp_end_ep=self.vc_ramp_end_ep,
+            v_max=self.vc_eta_max,
+        )
+
     def update_world_model_once(
         self,
         *,
@@ -269,12 +295,7 @@ class WMConcurrentCallback(TrainingCallback):
             action_seq=batch["action_enc_seq"],
             sample=True,
         )
-        eta = _vc_eta(
-            episode,
-            warmup_ep=self.vc_warmup_ep,
-            ramp_end_ep=self.vc_ramp_end_ep,
-            v_max=self.vc_eta_max,
-        )
+        eta = self._eta_for_episode(episode)
         q_teacher_t, g_lambda_t = self._maybe_vc_targets(batch=batch, eta=eta)
         details, total = compute_wm_losses(
             out,
@@ -304,6 +325,8 @@ class WMConcurrentCallback(TrainingCallback):
         return result
 
     def _run_wm_updates(self, *, episode: int) -> Optional[dict[str, float]]:
+        if self.curriculum_active and int(episode) < int(self.value_expansion_model_warmup_ep):
+            return None
         last: Optional[dict[str, float]] = None
         for _ in range(int(max(1, self.wm_updates_per_learn))):
             res = self.update_world_model_once(batch_size=self.wm_batch_size, episode=episode)
@@ -314,6 +337,16 @@ class WMConcurrentCallback(TrainingCallback):
 
     def after_train_step(self, context: TrainHookContext, result: Optional[dict[str, float]]) -> None:
         if result is None:
+            ep = int(context.episode)
+            in_wm_only = (
+                self.curriculum_active
+                and int(self.value_expansion_model_warmup_ep)
+                <= ep
+                < int(self.value_expansion_ramp_start_ep)
+            )
+            if not in_wm_only:
+                return
+            self._run_wm_updates(episode=ep)
             return
         self._run_wm_updates(episode=int(context.episode))
 

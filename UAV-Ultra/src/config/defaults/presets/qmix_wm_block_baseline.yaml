@@ -1,19 +1,19 @@
 algorithm: qmix
-description: "Baseline equivalent: train_qmix_wm_alternating.py (50/50 block alternating + L_VC)"
-source: "Main/train/train_qmix_wm_alternating.py@2360ab92"
+description: "5090 tuned preset: train_qmix_wm_alternating.py (50/50 block alternating + L_VC)"
+source: "UAV-Ultra/docs/5090-服务器后台训练命令.md"
 env: {}
 algo:
-  n_episode: 500
+  n_episode: 3000
   n_steps: null
-  num_envs: 32
-  batch_size: 256
+  num_envs: 16
+  batch_size: 512
   buffer_capacity: 200000
   learn_every: 4
   updates_per_learn: 1
   seed: 0
   device: auto
   use_amp: true
-  start_method: spawn
+  start_method: fork
   loss_log_every: 1
   gamma: 0.99
   target_update_interval: 200
@@ -23,7 +23,7 @@ algo:
   epsilon_start: 0.2
   epsilon_min: 0.01
   epsilon_decay: 0.995
-  lr_mixer: null
+  lr_mixer: 0.001
   mixing_hidden_dim: 32
   hypernet_hidden_dim: 64
   value_target_clip: 1000.0
@@ -34,6 +34,10 @@ algo:
   value_expansion_seq_len: 8
   value_expansion_td_lambda: 0.8
   value_expansion_rollout_k: 4
+  value_expansion_model_warmup_ep: 200
+  value_expansion_ramp_start_ep: 300
+  value_expansion_ramp_end_ep: 500
+  value_expansion_alpha_model_max: 0.01
   wm_block_qmix_episodes: 50
   wm_block_wm_episodes: 50
   wm_batch_size: 512
@@ -57,3 +61,7 @@ algo:
   use_jammer_feature: true
   critic_stable_tau: 0.005
   critic_stable_lr_scale: 1.0
+  critic_stable_lr_decay_enabled: false
+  critic_stable_lr_decay_start_ep: 1500
+  critic_stable_lr_decay_end_ep: 3000
+  critic_stable_lr_decay_min: 0.1

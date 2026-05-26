@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from src.config import specs
 from src.config.loader import load_env_config
@@ -82,6 +84,7 @@ def test_dqn_loop_learns_between_step_async_and_step_wait_then_stores():
     )
 
     metrics, train_results = run_dqn_loop(
+        algorithm="qmix",
         trainer=_Trainer(),
         vecenv=vecenv,
         env_cfg=env_cfg,
@@ -182,10 +185,83 @@ def test_training_cli_accepts_baseline_preset(capsys):
             "cpu",
             "--start-method",
             "fork",
+            "--no-amp",
             "--no-save",
         ]
     )
     assert "Training completed for qmix" in capsys.readouterr().out
+
+
+def test_training_cli_rejects_conflicting_amp_flags():
+    with pytest.raises(SystemExit):
+        main(["qmix", "--amp", "--no-amp", "--no-save"])
+
+
+def test_run_training_use_amp_override_and_mappo_rejection():
+    result = run_training(
+        "qmix",
+        algo_overrides={
+            "n_episode": 1,
+            "n_steps": 1,
+            "num_envs": 1,
+            "batch_size": 2,
+            "buffer_capacity": 8,
+            "learn_every": 1,
+            "updates_per_learn": 1,
+            "seed": 14,
+            "device": "cpu",
+            "start_method": "fork",
+        },
+        use_amp=False,
+        no_save=True,
+    )
+    assert result.trainer.use_amp is False
+
+    with pytest.raises(ValueError, match="MAPPO does not support AMP override"):
+        run_training(
+            "mappo",
+            algo_overrides={"n_episode": 1, "n_steps": 1, "device": "cpu", "minibatch_size": 8},
+            use_amp=False,
+            no_save=True,
+        )
+
+
+def test_run_training_resume_records_metadata_and_reapplies_critic_stable_lr(tmp_path):
+    overrides = {
+        "callbacks": ["critic_stable"],
+        "n_episode": 1,
+        "n_steps": 2,
+        "num_envs": 1,
+        "batch_size": 2,
+        "buffer_capacity": 8,
+        "learn_every": 1,
+        "updates_per_learn": 1,
+        "seed": 15,
+        "device": "cpu",
+        "start_method": "fork",
+        "critic_stable_lr_scale": 1.0,
+    }
+    first = run_training("qmix", algo_overrides=overrides, no_save=False, output_root=tmp_path)
+    ckpt_path = first.output_dir / "qmix_weights.pth"
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt["callbacks"]["critic_stable"]["lr_scale"] = 0.25
+    torch.save(ckpt, ckpt_path)
+
+    resumed = run_training(
+        "qmix",
+        algo_overrides=overrides,
+        resume_from=ckpt_path,
+        no_save=False,
+        output_root=tmp_path,
+    )
+    base_actor_lr = float(resumed.trainer.agents[0].actor_opt.defaults["lr"])
+    assert resumed.trainer.agents[0].actor_opt.param_groups[0]["lr"] == pytest.approx(
+        base_actor_lr * 0.25
+    )
+    data = json.loads((resumed.output_dir / "training_data.json").read_text(encoding="utf-8"))
+    resume = data["config"]["resume_from"]
+    assert resume["path"] == str(ckpt_path.resolve())
+    assert len(resume["sha256"]) == 64
 
 
 def test_qmix_runner_smoke_with_jp_full_combo():

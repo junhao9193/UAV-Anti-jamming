@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from src.training.checkpoint import save_checkpoint
-from src.training.logging import save_training_data
+from src.training.logging import default_output_root, make_unique_output_dir, save_training_data
 from src.training.runner import run_training
 
 
@@ -32,12 +32,16 @@ def test_training_data_schema_matches_baseline(tmp_path):
     assert result.output_dir is not None
     json_path = result.output_dir / "training_data.json"
     npz_path = result.output_dir / "training_data.npz"
+    log_path = result.output_dir / "qmix_1_seed7.out"
     data = json.loads(json_path.read_text(encoding="utf-8"))
 
     assert set(data.keys()) == {"algorithm", "timestamp", "config", "metrics"}
     assert data["algorithm"] == "qmix"
     assert {"n_episode", "n_steps", "artifact_kind", "env_summary"}.issubset(data["config"])
     assert data["config"]["preset"] is None
+    assert data["config"]["log_file"] == str(log_path)
+    assert log_path.exists()
+    assert "[qmix] ep=1/1" in log_path.read_text(encoding="utf-8")
     assert set(data["metrics"].keys()) == {"reward", "success_rate", "energy", "jump"}
     for key in ("reward", "success_rate", "energy", "jump"):
         assert isinstance(data["metrics"][key], list)
@@ -47,6 +51,19 @@ def test_training_data_schema_matches_baseline(tmp_path):
     npz = np.load(npz_path)
     assert set(npz.files) == {"reward", "success_rate", "energy", "jump"}
     assert npz["reward"].dtype == np.float32
+
+
+def test_default_output_root_is_project_runs_experiment_data():
+    assert default_output_root().name == "experiment-data"
+    assert default_output_root().parent.name == "runs"
+    assert default_output_root().parents[1].name == "UAV-Ultra"
+
+
+def test_output_dirs_use_incrementing_exp_names(tmp_path):
+    first = make_unique_output_dir(tmp_path, "qmix")
+    second = make_unique_output_dir(tmp_path, "qmix")
+    assert first == tmp_path / "qmix_exp1"
+    assert second == tmp_path / "qmix_exp2"
 
 
 def test_training_data_records_baseline_preset_metadata(tmp_path):
@@ -74,7 +91,8 @@ def test_training_data_records_baseline_preset_metadata(tmp_path):
     assert preset["name"] == "qmix_plain_baseline"
     assert preset["path"].endswith("qmix_plain_baseline.yaml")
     assert len(preset["sha256"]) == 64
-    assert preset["source"] == "Main/train/train_qmix.py@2360ab92"
+    assert preset["source"] == "UAV-Ultra/docs/5090-服务器后台训练命令.md"
+    assert (result.output_dir / "qmix_1_seed13.out").exists()
 
 
 def test_save_training_data_eval_kind_switches_filename_and_rejects_unknown_kind(tmp_path):

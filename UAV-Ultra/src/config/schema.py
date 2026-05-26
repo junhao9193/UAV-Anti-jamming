@@ -254,6 +254,10 @@ class QMIXConfig:
     value_expansion_seq_len: int
     value_expansion_td_lambda: float
     value_expansion_rollout_k: int
+    value_expansion_model_warmup_ep: int
+    value_expansion_ramp_start_ep: int
+    value_expansion_ramp_end_ep: int
+    value_expansion_alpha_model_max: float
     # Stage 7：WM concurrent / block-alternating + L_VC
     wm_block_qmix_episodes: int
     wm_block_wm_episodes: int
@@ -280,6 +284,10 @@ class QMIXConfig:
     use_jammer_feature: bool
     critic_stable_tau: float
     critic_stable_lr_scale: float
+    critic_stable_lr_decay_enabled: bool
+    critic_stable_lr_decay_start_ep: int
+    critic_stable_lr_decay_end_ep: int
+    critic_stable_lr_decay_min: float
 
 
 @dataclass(frozen=True)

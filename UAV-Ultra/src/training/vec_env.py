@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys
+import traceback
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+_WORKER_ERROR = "__uav_ultra_vecenv_worker_error__"
 
 
 def make_fixed_p_trans(env: Any) -> np.ndarray:
@@ -83,6 +88,19 @@ def _env_worker(
                 raise RuntimeError(f"Unknown vecenv command: {cmd!r}")
     except KeyboardInterrupt:
         pass
+    except Exception:
+        message = traceback.format_exc()
+        print(message, file=sys.stderr, flush=True)
+        try:
+            remote.send((_WORKER_ERROR, message))
+        except Exception:
+            pass
+
+
+def _raise_if_worker_error(message: Any) -> Any:
+    if isinstance(message, tuple) and len(message) == 2 and message[0] == _WORKER_ERROR:
+        raise RuntimeError(f"SubprocVecEnv worker failed:\n{message[1]}")
+    return message
 
 
 class SubprocVecEnv:
@@ -122,7 +140,7 @@ class SubprocVecEnv:
     def reset(self, p_trans: Optional[np.ndarray] = None) -> np.ndarray:
         for remote in self.remotes:
             remote.send(("reset", p_trans))
-        states = [remote.recv() for remote in self.remotes]
+        states = [_raise_if_worker_error(remote.recv()) for remote in self.remotes]
         return np.stack(states, axis=0).astype(np.float32)
 
     def step_async(self, actions: Sequence[Any]) -> None:
@@ -137,7 +155,7 @@ class SubprocVecEnv:
     def step_wait(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
         if not self.waiting:
             raise RuntimeError("step_wait called without a pending step_async")
-        results = [remote.recv() for remote in self.remotes]
+        results = [_raise_if_worker_error(remote.recv()) for remote in self.remotes]
         self.waiting = False
         next_states, rewards, dones, infos = zip(*results)
         return (
@@ -154,7 +172,7 @@ class SubprocVecEnv:
     def get_metrics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         for remote in self.remotes:
             remote.send(("metrics", None))
-        energy, jump, suc = zip(*(remote.recv() for remote in self.remotes))
+        energy, jump, suc = zip(*(_raise_if_worker_error(remote.recv()) for remote in self.remotes))
         return (
             np.asarray(energy, dtype=np.float32),
             np.asarray(jump, dtype=np.float32),

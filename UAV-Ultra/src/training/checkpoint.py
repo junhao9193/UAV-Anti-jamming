@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
+
+
+def resume_metadata(path: Path) -> dict[str, str]:
+    p = Path(path).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"resume checkpoint not found: {p}")
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return {"path": str(p), "sha256": h.hexdigest()}
 
 
 def trainer_state_dict(trainer: Any, *, algorithm: str) -> dict[str, Any]:
@@ -347,6 +359,7 @@ def load_callback_states(
 __all__ = [
     "load_callback_states",
     "load_trainer_state_dict",
+    "resume_metadata",
     "save_checkpoint",
     "trainer_state_dict",
 ]

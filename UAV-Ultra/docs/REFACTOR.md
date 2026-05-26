@@ -36,7 +36,7 @@
 
 ### 3. 工程约束
 - 唯一可导入包 `src/`，通过 `pyproject.toml` 安装；禁止 `sys.path` 拼接、禁止 `parents[N]` 式路径推断。
-- 训练/评估产物（权重、日志、曲线）默认落到仓库根 `Draw/experiment-data/`，保持与旧 baseline 分析脚本兼容；用户通过 `output_root` 覆盖到 `runs/` 或其它目录时也不得进版本库。
+- 训练/评估产物（权重、曲线）默认落到 `UAV-Ultra/runs/experiment-data/`；后台 stdout/stderr 日志统一落到 `UAV-Ultra/runs/logs/`；用户通过 `output_root` 覆盖到其它目录时也不得进版本库。
 - 每个环境子模块（mobility / channel / reward / …）必须可独立单元测试。
 - 配置类型化：所有超参经 dataclass schema，加载即校验；不再以「函数默认参数」承载超参。
 
@@ -59,7 +59,7 @@
 | trainer 变体复制 | qmix 下 4 份 trainer | 收敛为 1 份 + 可组合回调 |
 | 重复部件 | 4 份 `joint_replay_buffer`、散落 mixer | 收口到 `algorithms/common/{buffers,networks,optim}/` |
 | 配置未类型化 | 仅 `env.yaml`，算法参数硬编码 | dataclass schema + 分层 YAML defaults |
-| 产物混入源码 | `logs/` 在仓库内 | 默认统一到仓库根 `Draw/experiment-data/`；自定义 `output_root` 产物由 `.gitignore` 忽略 |
+| 产物混入源码 | `logs/` 在仓库内 | 默认产物统一到 `runs/experiment-data/`，后台日志统一到 `runs/logs/`；自定义 `output_root` 产物由 `.gitignore` 忽略 |
 
 ### 2. 关键设计目标
 
@@ -78,7 +78,7 @@ UAV-Ultra/
 ├── pyproject.toml
 ├── README.md
 ├── REFACTOR.md
-├── .gitignore                  # 忽略本地 Draw/ 与 runs/
+├── .gitignore                  # 忽略本地 runs/ 与旧 Draw/
 │
 ├── src/                  # 唯一可导入包
 │   ├── entities/               # 纯领域实体：无算法、无 torch
@@ -159,18 +159,20 @@ UAV-Ultra/
 ├── configs/experiments/*.yaml  # 用户实验配置（覆盖 defaults）
 ├── scripts/                    # Stage 0 golden-master 生成等一次性脚本
 ├── tests/                      # 单元 + 集成测试
-├── runs/                       # 可选 output_root（.gitignore）
+├── runs/                       # 默认训练/评估产物（.gitignore）
 └── docs/
 ```
 
-默认产物路径不在 `UAV-Ultra/` 包目录内，而在共享仓库根：
+默认产物路径在 `UAV-Ultra/` 下的本地运行目录：
 
 ```text
-../Draw/experiment-data/{algorithm}_{timestamp}/
+runs/experiment-data/{algorithm}_expN/
   training_data.json
   training_data.npz
   {algorithm}_weights.pth
 ```
+
+其中 `expN` 是递增实验次数，例如 `qmix_exp1`、`qmix_exp2`。
 
 ---
 

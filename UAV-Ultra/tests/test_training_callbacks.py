@@ -127,6 +127,48 @@ def test_critic_stable_soft_update_and_lr_scale():
     assert trainer.target_update_interval == 7
 
 
+def test_critic_stable_lr_decay_and_missing_new_state_keys():
+    from src.training.callbacks.base import TrainHookContext
+
+    class _Agent:
+        def __init__(self):
+            self.actor = nn.Linear(2, 1)
+            self.target_actor = nn.Linear(2, 1)
+            self.q_net = nn.Linear(2, 1)
+            self.target_q_net = nn.Linear(2, 1)
+            self.actor_opt = torch.optim.SGD(self.actor.parameters(), lr=0.1)
+            self.q_opt = torch.optim.SGD(self.q_net.parameters(), lr=0.2)
+
+    trainer = SimpleNamespace(agents=[_Agent()], target_update_interval=7)
+    cb = CriticStableCallback(
+        tau=0.1,
+        lr_scale=1.0,
+        lr_decay_enabled=True,
+        lr_decay_start_ep=10,
+        lr_decay_end_ep=20,
+        lr_decay_min=0.1,
+    )
+    cb.attach(trainer=trainer, env_cfg=None, algo_cfg=None, n_envs=1)
+
+    assert cb.should_skip_q_update(TrainHookContext(trainer=trainer, episode=0, step=0)) is False
+    assert trainer.agents[0].actor_opt.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert cb.should_skip_q_update(TrainHookContext(trainer=trainer, episode=15, step=0)) is False
+    assert trainer.agents[0].actor_opt.param_groups[0]["lr"] == pytest.approx(0.055)
+    assert trainer.agents[0].q_opt.param_groups[0]["lr"] == pytest.approx(0.11)
+    assert cb.should_skip_q_update(TrainHookContext(trainer=trainer, episode=20, step=0)) is False
+    assert trainer.agents[0].actor_opt.param_groups[0]["lr"] == pytest.approx(0.01)
+
+    old_state = {"tau": 0.2, "lr_scale": 0.5, "original_target_update_interval": 9}
+    fresh = CriticStableCallback(lr_decay_enabled=True, lr_decay_start_ep=3)
+    fresh.load_state_dict(old_state, strict=True)
+    assert fresh.tau == pytest.approx(0.2)
+    assert fresh.lr_scale == pytest.approx(0.5)
+    assert fresh.lr_decay_enabled is True
+    assert fresh.lr_decay_start_ep == 3
+    with pytest.raises(ValueError, match="unexpected state keys"):
+        fresh.load_state_dict({**old_state, "bogus": 1}, strict=True)
+
+
 def test_value_expansion_rejects_non_qmix_trainer_and_per_agent_reward_batch():
     env_cfg = load_env_config()
     algo_cfg = SimpleNamespace(
@@ -251,6 +293,38 @@ def test_wm_concurrent_skips_update_when_trainer_step_returns_none():
     assert calls == [2]
 
 
+def test_wm_concurrent_curriculum_wm_only_phase_runs_without_q_result():
+    env_cfg = load_env_config()
+    algo_cfg = SimpleNamespace(
+        gamma=0.99,
+        buffer_capacity=16,
+        value_expansion_seq_len=4,
+        value_expansion_td_lambda=0.8,
+        value_expansion_rollout_k=1,
+        value_expansion_model_warmup_ep=2,
+        value_expansion_ramp_start_ep=4,
+        value_expansion_ramp_end_ep=6,
+        wm_batch_size=1,
+        wm_updates_per_learn=1,
+        wm_vc_eta_max=0.2,
+        wm_vc_warmup_ep=100,
+        wm_vc_ramp_end_ep=200,
+    )
+    cb = WMConcurrentCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, curriculum_active=True)
+    calls = []
+    cb._run_wm_updates = lambda *, episode: calls.append(episode) or {"wm_loss": 1.0}
+
+    cb.after_train_step(SimpleNamespace(trainer=SimpleNamespace(batch_size=3), episode=1, step=0), result=None)
+    assert calls == []
+    cb.after_train_step(SimpleNamespace(trainer=SimpleNamespace(batch_size=3), episode=2, step=0), result=None)
+    assert calls == [2]
+    cb.after_train_step(SimpleNamespace(trainer=SimpleNamespace(batch_size=3), episode=4, step=0), result=None)
+    assert calls == [2]
+    assert cb._eta_for_episode(3) == pytest.approx(0.0)
+    assert cb._eta_for_episode(5) == pytest.approx(0.1)
+    assert cb._eta_for_episode(6) == pytest.approx(0.2)
+
+
 def test_wm_concurrent_records_every_wm_update_result():
     env_cfg = load_env_config()
     cb, _ = _build_concurrent_cb(env_cfg)
@@ -340,6 +414,8 @@ def test_build_callbacks_ignores_user_order():
         "wm_concurrent",
         "critic_stable",
     ]
+    assert manager.callbacks[1].curriculum_active is True
+    assert manager.callbacks[2].curriculum_active is True
     # block alternating 也按 canonical 顺序
     manager2 = build_callbacks(
         ["critic_stable", "wm_block_alternating", "value_expansion"],
@@ -351,6 +427,34 @@ def test_build_callbacks_ignores_user_order():
         "wm_block_alternating",
         "critic_stable",
     ]
+    assert manager2.callbacks[0].curriculum_active is False
+
+
+def test_value_expansion_curriculum_boundaries_and_static_block_mode():
+    from src.training.callbacks.base import TrainHookContext
+
+    env_cfg = load_env_config()
+    algo_cfg = SimpleNamespace(
+        value_expansion_alpha_model=0.5,
+        value_expansion_seq_len=4,
+        value_expansion_model_warmup_ep=2,
+        value_expansion_ramp_start_ep=4,
+        value_expansion_ramp_end_ep=6,
+        value_expansion_alpha_model_max=0.2,
+    )
+    cb = ValueExpansionCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, curriculum_active=True)
+    assert cb._effective_alpha(0) == pytest.approx(0.0)
+    assert cb._effective_alpha(4) == pytest.approx(0.0)
+    assert cb._effective_alpha(5) == pytest.approx(0.1)
+    assert cb._effective_alpha(6) == pytest.approx(0.2)
+    assert cb.should_skip_q_update(TrainHookContext(trainer=object(), episode=1, step=0)) is False
+    assert cb.should_skip_q_update(TrainHookContext(trainer=object(), episode=2, step=0)) is True
+    assert cb.should_skip_q_update(TrainHookContext(trainer=object(), episode=3, step=0)) is True
+    assert cb.should_skip_q_update(TrainHookContext(trainer=object(), episode=4, step=0)) is False
+
+    static = ValueExpansionCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, curriculum_active=False)
+    assert static._effective_alpha(0) == pytest.approx(0.5)
+    assert static.should_skip_q_update(TrainHookContext(trainer=object(), episode=3, step=0)) is False
 
 
 def test_callback_manager_phase_skip_short_circuits_q_update():
@@ -371,6 +475,14 @@ def test_callback_manager_phase_skip_short_circuits_q_update():
             self.on_train_step_calls += 1
             return {"loss_q": 9.9}
 
+    class _ObserverCB(TrainingCallback):
+        name = "observer"
+        def __init__(self):
+            self.should_calls = 0
+        def should_skip_q_update(self, context):
+            self.should_calls += 1
+            return False
+
     class _CountingTrainer:
         def __init__(self):
             self.train_step_calls = 0
@@ -380,11 +492,13 @@ def test_callback_manager_phase_skip_short_circuits_q_update():
 
     skipper = _SkipperCB()
     eager = _EagerCB()
+    observer = _ObserverCB()
     trainer = _CountingTrainer()
-    mgr = CallbackManager([eager, skipper])
+    mgr = CallbackManager([skipper, observer, eager])
     ctx = TrainHookContext(trainer=trainer, episode=0, step=0)
     out = mgr.train_step(ctx)
     assert out is None
+    assert observer.should_calls == 1
     assert eager.on_train_step_calls == 0
     assert trainer.train_step_calls == 0
     assert skipper.last_result is None

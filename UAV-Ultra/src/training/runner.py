@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
 import random
+import re
+import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -24,8 +28,13 @@ from src.config.loader import (
 )
 from src.envs import Environ
 from src.training.callbacks import CallbackManager, TrainHookContext, build_callbacks
-from src.training.checkpoint import save_checkpoint
-from src.training.logging import save_training_data
+from src.training.checkpoint import (
+    load_callback_states,
+    load_trainer_state_dict,
+    resume_metadata,
+    save_checkpoint,
+)
+from src.training.logging import reserve_output_dir, save_training_data
 from src.training.metrics import aggregate_baseline_metrics, success_rate_from_suc
 from src.training.schedules import epsilon_by_episode
 from src.training.vec_env import SubprocVecEnv, make_fixed_p_trans
@@ -40,6 +49,123 @@ class TrainingResult:
     metrics: dict[str, list[float]]
     output_dir: Path | None = None
     train_results: list[dict[str, float]] = dataclasses.field(default_factory=list)
+
+
+class _TeeStream:
+    def __init__(self, *streams: Any):
+        self._streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
+        self.errors = getattr(streams[0], "errors", "replace") if streams else "replace"
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return bool(self._streams and self._streams[0].isatty())
+
+
+_PRESET_LOG_STEMS = {
+    "iql_baseline": "iql",
+    "vdn_baseline": "vdn",
+    "qmix_plain_baseline": "qmix",
+    "qplex_baseline": "qplex",
+    "mappo_baseline": "mappo",
+    "qmix_wm_concurrent_baseline": "qmix_wm_concurrent",
+    "qmix_wm_concurrent_jp_baseline": "qmix_wm_concurrent_jp",
+    "qmix_wm_block_baseline": "qmix_wm_block",
+    "qmix_wm_block_jp_baseline": "qmix_wm_block_jp",
+    "qmix_wm_block_jp_cs_baseline": "qmix_wm_block_jp_cs",
+}
+
+
+def _safe_log_stem(raw: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw).strip())
+    stem = stem.strip("._-")
+    return stem or "training"
+
+
+def _default_run_log_name(
+    *,
+    algorithm: str,
+    algo_cfg: Any,
+    preset_info: dict[str, Any] | None,
+) -> str:
+    preset_name = None if preset_info is None else str(preset_info.get("name") or "")
+    if preset_name:
+        stem = _PRESET_LOG_STEMS.get(preset_name)
+        if stem is None:
+            stem = preset_name.removesuffix("_baseline")
+    else:
+        stem = str(algorithm)
+    return f"{_safe_log_stem(stem)}_{int(algo_cfg.n_episode)}_seed{int(algo_cfg.seed)}.out"
+
+
+class _RunLogTee:
+    def __init__(self, output_dir: Path | None, log_name: str | None):
+        self.output_dir = output_dir
+        self.log_path = None if output_dir is None else output_dir / _safe_log_stem(log_name or "training.out")
+        self._file = None
+        self._stdout = None
+        self._stderr = None
+
+    def __enter__(self):
+        if self.log_path is None:
+            return self
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.log_path.open("a", encoding="utf-8", buffering=1)
+        self._stdout = sys.stdout
+        self._stderr = sys.stderr
+        sys.stdout = _TeeStream(self._stdout, self._file)
+        sys.stderr = _TeeStream(self._stderr, self._file)
+        print(f"[training-runner] run_log={self.log_path}", flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self.log_path is not None and exc_type is not None:
+            print("[training-runner] run failed; traceback follows:", file=sys.stderr, flush=True)
+            traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if self._stdout is not None:
+            sys.stdout = self._stdout
+        if self._stderr is not None:
+            sys.stderr = self._stderr
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+        return False
+
+
+def _configure_process_logging() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True, write_through=True)
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
+
+def _run_main_with_error_logging(argv: list[str] | None = None) -> None:
+    _configure_process_logging()
+    try:
+        main(argv)
+    except KeyboardInterrupt:
+        print("[training-runner] interrupted by KeyboardInterrupt", file=sys.stderr, flush=True)
+        raise
+    except Exception:
+        print("[training-runner] unhandled exception; full traceback follows:", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.stdout.flush()
+        raise SystemExit(1)
 
 
 def _default_env_yaml_path() -> Path:
@@ -80,6 +206,96 @@ def _seed_everything(seed: int) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
+
+
+def _reapply_loaded_callback_runtime_state(callbacks: CallbackManager, trainer: Any) -> None:
+    for cb in callbacks:
+        if getattr(cb, "name", "") == "critic_stable" and hasattr(cb, "apply_lr_scale"):
+            cb.apply_lr_scale(trainer)
+
+
+def _mean_numeric_fields(rows: list[dict[str, float]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        for key, value in row.items():
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(val):
+                continue
+            totals[key] = totals.get(key, 0.0) + val
+            counts[key] = counts.get(key, 0) + 1
+    return {key: totals[key] / max(1, counts[key]) for key in totals}
+
+
+def _progress_from_callbacks(callbacks: CallbackManager, episode: int) -> dict[str, float | str]:
+    fields: dict[str, float | str] = {}
+    for cb in callbacks:
+        phase_for_episode = getattr(cb, "_phase_for_episode", None)
+        if callable(phase_for_episode):
+            fields["phase"] = str(phase_for_episode(int(episode)))
+        last_wm_result = getattr(cb, "last_wm_result", None)
+        if last_wm_result:
+            for key, value in dict(last_wm_result[-1]).items():
+                if key.startswith("wm_"):
+                    fields[key] = float(value)
+        if getattr(cb, "name", "") == "jammer_prediction":
+            warmup = max(1, int(getattr(cb, "warmup_episodes", 1)))
+            use_feature = bool(getattr(cb, "use_feature", True))
+            fields["fs"] = min(1.0, float(episode) / float(warmup)) if use_feature else 0.0
+    return fields
+
+
+def _should_log_episode(algo_cfg: Any, episode: int, n_episode: int) -> bool:
+    every = int(max(1, getattr(algo_cfg, "loss_log_every", 1)))
+    return episode == 0 or (episode + 1) % every == 0 or episode == n_episode - 1
+
+
+def _format_progress_value(value: float | str) -> str:
+    if isinstance(value, str):
+        return value
+    value = float(value)
+    if not np.isfinite(value):
+        return str(value)
+    if abs(value) >= 1000:
+        return f"{value:.1f}"
+    if abs(value) >= 10:
+        return f"{value:.2f}"
+    return f"{value:.4f}"
+
+
+def _log_episode_progress(
+    *,
+    algorithm: str,
+    episode: int,
+    n_episode: int,
+    reward_history: list[float],
+    success_rate_history: list[float],
+    energy_history: list[float],
+    jump_history: list[float],
+    train_summary: dict[str, float],
+    extra_fields: dict[str, float | str] | None = None,
+) -> None:
+    avg_window = min(10, len(reward_history))
+    fields: dict[str, float | str] = {
+        "reward": float(reward_history[-1]),
+        "avg10": float(np.mean(reward_history[-avg_window:])),
+        "sr": float(success_rate_history[-1]),
+        "energy": float(energy_history[-1]),
+        "jump": float(jump_history[-1]),
+    }
+    if extra_fields:
+        fields.update(extra_fields)
+    for key in ("loss_q", "loss_actor", "loss_jammer", "wm_loss", "wm_L_VC", "wm_eta", "loss_pi", "loss_v"):
+        if key in train_summary:
+            fields[key] = float(train_summary[key])
+
+    payload = " ".join(f"{key}={_format_progress_value(value)}" for key, value in fields.items())
+    print(f"[{algorithm}] ep={episode + 1}/{n_episode} {payload}", flush=True)
 
 
 def _configure_torch(device: str) -> None:
@@ -137,6 +353,7 @@ def _select_dqn_actions(
 
 def run_dqn_loop(
     *,
+    algorithm: str,
     trainer: Any,
     vecenv: Any,
     env_cfg: Any,
@@ -159,6 +376,7 @@ def run_dqn_loop(
 
     global_step = 0
     for episode in range(n_episode):
+        episode_train_results: list[dict[str, float]] = []
         states = vecenv.reset(p_trans)
         if states.shape != (n_envs, n_agents, state_dim):
             raise RuntimeError(
@@ -200,6 +418,7 @@ def run_dqn_loop(
                     )
                     if result is not None:
                         train_results.append(result)
+                        episode_train_results.append(result)
 
             next_states, rewards, dones, infos = vecenv.step_wait()
             is_last_step = step == n_steps - 1
@@ -254,6 +473,20 @@ def run_dqn_loop(
         success_rate_history.append(float(agg["success_rate"]))
         energy_history.append(float(agg["energy"]))
         jump_history.append(float(agg["jump"]))
+        if _should_log_episode(algo_cfg, episode, n_episode):
+            extra_fields = {"eps": float(epsilon)}
+            extra_fields.update(_progress_from_callbacks(callbacks, episode))
+            _log_episode_progress(
+                algorithm=algorithm,
+                episode=episode,
+                n_episode=n_episode,
+                reward_history=reward_history,
+                success_rate_history=success_rate_history,
+                energy_history=energy_history,
+                jump_history=jump_history,
+                train_summary=_mean_numeric_fields(episode_train_results),
+                extra_fields=extra_fields,
+            )
 
     return (
         {
@@ -273,6 +506,8 @@ def _run_dqn_training(
     algo_cfg: Any,
     env_overrides: dict[str, Any] | None,
     preset_info: dict[str, Any] | None,
+    resume_from: Path | None,
+    resume_info: dict[str, Any] | None,
     no_save: bool,
     output_root: Path | None,
     vecenv_factory: Callable[..., Any] = SubprocVecEnv,
@@ -283,69 +518,82 @@ def _run_dqn_training(
     _configure_torch(device)
     _seed_everything(int(algo_cfg.seed))
 
-    env0 = Environ(config=env_overrides)
-    p_trans_fixed = make_fixed_p_trans(env0)
-    trainer = build_trainer(algorithm, env_cfg=env_cfg, algo_cfg=algo_cfg, device=device)
-    callbacks = build_callbacks(getattr(algo_cfg, "callbacks", []), env_cfg=env_cfg, algo_cfg=algo_cfg)
-    callbacks.attach(trainer=trainer, env_cfg=env_cfg, algo_cfg=algo_cfg, n_envs=int(algo_cfg.num_envs))
+    output_dir = None if no_save else reserve_output_dir(algorithm, output_root=output_root)
+    log_name = _default_run_log_name(algorithm=algorithm, algo_cfg=algo_cfg, preset_info=preset_info)
+    log_path = None if output_dir is None else output_dir / log_name
+    with _RunLogTee(output_dir, log_name):
+        env0 = Environ(config=env_overrides)
+        p_trans_fixed = make_fixed_p_trans(env0)
+        trainer = build_trainer(algorithm, env_cfg=env_cfg, algo_cfg=algo_cfg, device=device)
+        callbacks = build_callbacks(getattr(algo_cfg, "callbacks", []), env_cfg=env_cfg, algo_cfg=algo_cfg)
+        callbacks.attach(trainer=trainer, env_cfg=env_cfg, algo_cfg=algo_cfg, n_envs=int(algo_cfg.num_envs))
+        if resume_from is not None:
+            checkpoint = load_trainer_state_dict(trainer, resume_from, algorithm, device=device)
+            load_callback_states(list(callbacks), checkpoint.get("callbacks", {}), strict=True)
+            _reapply_loaded_callback_runtime_state(callbacks, trainer)
 
-    vecenv = vecenv_factory(
-        int(algo_cfg.num_envs),
-        p_trans=p_trans_fixed,
-        start_method=str(algo_cfg.start_method),
-        seed=int(algo_cfg.seed),
-        env_overrides=env_overrides,
-    )
-    try:
-        metrics, train_results = run_dqn_loop(
-            trainer=trainer,
-            vecenv=vecenv,
-            env_cfg=env_cfg,
-            algo_cfg=algo_cfg,
-            callbacks=callbacks,
+        vecenv = vecenv_factory(
+            int(algo_cfg.num_envs),
             p_trans=p_trans_fixed,
+            start_method=str(algo_cfg.start_method),
+            seed=int(algo_cfg.seed),
+            env_overrides=env_overrides,
         )
-    finally:
-        vecenv.close()
+        try:
+            metrics, train_results = run_dqn_loop(
+                algorithm=algorithm,
+                trainer=trainer,
+                vecenv=vecenv,
+                env_cfg=env_cfg,
+                algo_cfg=algo_cfg,
+                callbacks=callbacks,
+                p_trans=p_trans_fixed,
+            )
+        finally:
+            vecenv.close()
 
-    output_dir = None
-    if not no_save:
-        run_config = {
-            "algorithm": algorithm,
-            "seed": int(algo_cfg.seed),
-            "num_envs": int(algo_cfg.num_envs),
-            "batch_size": int(algo_cfg.batch_size),
-            "buffer_capacity": int(algo_cfg.buffer_capacity),
-            "learn_every": int(algo_cfg.learn_every),
-            "updates_per_learn": int(algo_cfg.updates_per_learn),
-            "epsilon_start": float(algo_cfg.epsilon_start),
-            "epsilon_min": float(algo_cfg.epsilon_min),
-            "epsilon_decay": float(algo_cfg.epsilon_decay),
-            "device": str(device),
-            "start_method": str(algo_cfg.start_method),
-            "callbacks": list(getattr(algo_cfg, "callbacks", [])),
-            "preset": preset_info,
-            **env_run_summary(env_cfg, _default_env_yaml_path(), overrides=env_overrides),
-        }
-        n_steps = resolve_episode_steps(env_cfg, algo_cfg.n_steps)
-        _, _, output_dir = save_training_data(
-            algorithm=algorithm,
-            reward_history=metrics["reward"],
-            success_rate_history=metrics["success_rate"],
-            energy_history=metrics["energy"],
-            jump_history=metrics["jump"],
-            n_episode=int(algo_cfg.n_episode),
-            n_steps=n_steps,
-            run_config=run_config,
-            output_root=output_root,
-        )
-        save_checkpoint(
-            path=output_dir / f"{algorithm}_weights.pth",
-            algorithm=algorithm,
-            trainer=trainer,
-            callbacks=list(callbacks),
-            extra={"n_steps": n_steps},
-        )
+        if output_dir is not None:
+            run_config = {
+                "algorithm": algorithm,
+                "seed": int(algo_cfg.seed),
+                "num_envs": int(algo_cfg.num_envs),
+                "batch_size": int(algo_cfg.batch_size),
+                "buffer_capacity": int(algo_cfg.buffer_capacity),
+                "learn_every": int(algo_cfg.learn_every),
+                "updates_per_learn": int(algo_cfg.updates_per_learn),
+                "epsilon_start": float(algo_cfg.epsilon_start),
+                "epsilon_min": float(algo_cfg.epsilon_min),
+                "epsilon_decay": float(algo_cfg.epsilon_decay),
+                "device": str(device),
+                "start_method": str(algo_cfg.start_method),
+                "callbacks": list(getattr(algo_cfg, "callbacks", [])),
+                "preset": preset_info,
+                "resume_from": resume_info,
+                "log_file": str(log_path),
+                "use_amp": bool(getattr(algo_cfg, "use_amp", False)),
+                **env_run_summary(env_cfg, _default_env_yaml_path(), overrides=env_overrides),
+            }
+            n_steps = resolve_episode_steps(env_cfg, algo_cfg.n_steps)
+            save_training_data(
+                algorithm=algorithm,
+                reward_history=metrics["reward"],
+                success_rate_history=metrics["success_rate"],
+                energy_history=metrics["energy"],
+                jump_history=metrics["jump"],
+                n_episode=int(algo_cfg.n_episode),
+                n_steps=n_steps,
+                run_config=run_config,
+                output_root=output_root,
+                data_dir=output_dir,
+            )
+            save_checkpoint(
+                path=output_dir / f"{algorithm}_weights.pth",
+                algorithm=algorithm,
+                trainer=trainer,
+                callbacks=list(callbacks),
+                extra={"n_steps": n_steps},
+            )
+            print(f"[training-runner] output_dir={output_dir}", flush=True)
 
     return TrainingResult(trainer=trainer, metrics=metrics, output_dir=output_dir, train_results=train_results)
 
@@ -356,6 +604,8 @@ def _run_mappo_training(
     algo_cfg: Any,
     env_overrides: dict[str, Any] | None,
     preset_info: dict[str, Any] | None,
+    resume_from: Path | None,
+    resume_info: dict[str, Any] | None,
     no_save: bool,
     output_root: Path | None,
 ) -> TrainingResult:
@@ -365,130 +615,152 @@ def _run_mappo_training(
     _configure_torch(device)
     _seed_everything(int(algo_cfg.seed))
 
-    trainer = build_trainer("mappo", env_cfg=env_cfg, algo_cfg=algo_cfg, device=device)
-    env = Environ(config={"env_seed": int(algo_cfg.seed), **(env_overrides or {})})
-    p_trans_fixed = make_fixed_p_trans(env)
-    n_steps = resolve_episode_steps(env_cfg, algo_cfg.n_steps)
-    n_agents = int(env_cfg.n_ch)
-    cont_dim = int(specs.param_dim_per_action(env_cfg))
+    output_dir = None if no_save else reserve_output_dir("mappo", output_root=output_root)
+    log_name = _default_run_log_name(algorithm="mappo", algo_cfg=algo_cfg, preset_info=preset_info)
+    log_path = None if output_dir is None else output_dir / log_name
+    with _RunLogTee(output_dir, log_name):
+        trainer = build_trainer("mappo", env_cfg=env_cfg, algo_cfg=algo_cfg, device=device)
+        if resume_from is not None:
+            checkpoint = load_trainer_state_dict(trainer, resume_from, "mappo", device=device)
+            load_callback_states([], checkpoint.get("callbacks", {}), strict=True)
+        env = Environ(config={"env_seed": int(algo_cfg.seed), **(env_overrides or {})})
+        p_trans_fixed = make_fixed_p_trans(env)
+        n_steps = resolve_episode_steps(env_cfg, algo_cfg.n_steps)
+        n_agents = int(env_cfg.n_ch)
+        cont_dim = int(specs.param_dim_per_action(env_cfg))
 
-    reward_history: list[float] = []
-    success_rate_history: list[float] = []
-    energy_history: list[float] = []
-    jump_history: list[float] = []
-    train_results: list[dict[str, float]] = []
+        reward_history: list[float] = []
+        success_rate_history: list[float] = []
+        energy_history: list[float] = []
+        jump_history: list[float] = []
+        train_results: list[dict[str, float]] = []
 
-    for _episode in range(int(algo_cfg.n_episode)):
-        state = env.reset(p_trans_fixed)
-        env.clear_reward()
-        buffer = RolloutBuffer(n_agents=n_agents)
-        episode_reward = 0.0
-        steps_done = 0
+        n_episode = int(algo_cfg.n_episode)
+        for _episode in range(n_episode):
+            state = env.reset(p_trans_fixed)
+            env.clear_reward()
+            buffer = RolloutBuffer(n_agents=n_agents)
+            episode_reward = 0.0
+            steps_done = 0
 
-        for _step in range(n_steps):
-            obs_step = np.stack(state, axis=0).astype(np.float32)
-            global_state = np.concatenate(state, axis=-1).astype(np.float32)
-            global_step = np.tile(global_state, (n_agents, 1)).astype(np.float32)
-            agent_ids = np.arange(n_agents, dtype=np.int64)
+            for _step in range(n_steps):
+                obs_step = np.stack(state, axis=0).astype(np.float32)
+                global_state = np.concatenate(state, axis=-1).astype(np.float32)
+                global_step = np.tile(global_state, (n_agents, 1)).astype(np.float32)
+                agent_ids = np.arange(n_agents, dtype=np.int64)
 
-            actions = []
-            act_discrete = np.zeros((n_agents,), dtype=np.int64)
-            act_cont = np.zeros((n_agents, cont_dim), dtype=np.float32)
-            log_probs = np.zeros((n_agents,), dtype=np.float32)
-            values = np.zeros((n_agents,), dtype=np.float32)
+                actions = []
+                act_discrete = np.zeros((n_agents,), dtype=np.int64)
+                act_cont = np.zeros((n_agents, cont_dim), dtype=np.float32)
+                log_probs = np.zeros((n_agents,), dtype=np.float32)
+                values = np.zeros((n_agents,), dtype=np.float32)
 
-            for i in range(n_agents):
-                res = trainer.act(obs_step[i], global_state, agent_id=i, deterministic=False)
-                params_full = np.zeros((int(specs.total_param_dim(env_cfg)),), dtype=np.float32)
-                start = int(res.action_discrete) * cont_dim
-                params_full[start : start + cont_dim] = res.action_cont
-                actions.append((int(res.action_discrete), params_full))
-                act_discrete[i] = int(res.action_discrete)
-                act_cont[i] = res.action_cont
-                log_probs[i] = float(res.log_prob)
-                values[i] = float(res.value)
+                for i in range(n_agents):
+                    res = trainer.act(obs_step[i], global_state, agent_id=i, deterministic=False)
+                    params_full = np.zeros((int(specs.total_param_dim(env_cfg)),), dtype=np.float32)
+                    start = int(res.action_discrete) * cont_dim
+                    params_full[start : start + cont_dim] = res.action_cont
+                    actions.append((int(res.action_discrete), params_full))
+                    act_discrete[i] = int(res.action_discrete)
+                    act_cont[i] = res.action_cont
+                    log_probs[i] = float(res.log_prob)
+                    values[i] = float(res.value)
 
-            next_state, rewards, done, _info = env.step(actions)
-            rewards = np.asarray(rewards, dtype=np.float32).reshape(n_agents)
-            done_step = np.full((n_agents,), float(done), dtype=np.float32)
-            buffer.add(
-                obs=obs_step,
-                global_state=global_step,
-                agent_id=agent_ids,
-                action_discrete=act_discrete,
-                action_cont=act_cont,
-                log_prob=log_probs,
-                value=values,
-                reward=rewards,
-                done=done_step,
+                next_state, rewards, done, _info = env.step(actions)
+                rewards = np.asarray(rewards, dtype=np.float32).reshape(n_agents)
+                done_step = np.full((n_agents,), float(done), dtype=np.float32)
+                buffer.add(
+                    obs=obs_step,
+                    global_state=global_step,
+                    agent_id=agent_ids,
+                    action_discrete=act_discrete,
+                    action_cont=act_cont,
+                    log_prob=log_probs,
+                    value=values,
+                    reward=rewards,
+                    done=done_step,
+                )
+
+                state = next_state
+                episode_reward += float(np.mean(rewards))
+                steps_done += 1
+                if done:
+                    break
+
+            global_state_last = np.concatenate(state, axis=-1).astype(np.float32)
+            global_last = np.tile(global_state_last, (n_agents, 1)).astype(np.float32)
+            last_values = trainer.value(global_last, np.arange(n_agents, dtype=np.int64))
+            returns, advantages = buffer.compute_returns_and_advantages(
+                last_value=last_values,
+                gamma=float(trainer.gamma),
+                gae_lambda=float(trainer.gae_lambda),
             )
+            update_info = trainer.update(buffer.as_batch(returns=returns, advantages=advantages))
+            train_results.append(update_info)
 
-            state = next_state
-            episode_reward += float(np.mean(rewards))
-            steps_done += 1
-            if done:
-                break
+            total_links = float(max(1, steps_done) * n_agents * int(specs.n_des(env_cfg)))
+            reward_history.append(float(episode_reward))
+            success_rate_history.append(success_rate_from_suc(float(env.rew_suc), total_links=total_links))
+            energy_history.append(float(env.rew_energy) / total_links)
+            jump_history.append(float(env.rew_jump) / total_links)
+            if _should_log_episode(algo_cfg, _episode, n_episode):
+                _log_episode_progress(
+                    algorithm="mappo",
+                    episode=_episode,
+                    n_episode=n_episode,
+                    reward_history=reward_history,
+                    success_rate_history=success_rate_history,
+                    energy_history=energy_history,
+                    jump_history=jump_history,
+                    train_summary=_mean_numeric_fields([update_info]),
+                )
 
-        global_state_last = np.concatenate(state, axis=-1).astype(np.float32)
-        global_last = np.tile(global_state_last, (n_agents, 1)).astype(np.float32)
-        last_values = trainer.value(global_last, np.arange(n_agents, dtype=np.int64))
-        returns, advantages = buffer.compute_returns_and_advantages(
-            last_value=last_values,
-            gamma=float(trainer.gamma),
-            gae_lambda=float(trainer.gae_lambda),
-        )
-        update_info = trainer.update(buffer.as_batch(returns=returns, advantages=advantages))
-        train_results.append(update_info)
-
-        total_links = float(max(1, steps_done) * n_agents * int(specs.n_des(env_cfg)))
-        reward_history.append(float(episode_reward))
-        success_rate_history.append(success_rate_from_suc(float(env.rew_suc), total_links=total_links))
-        energy_history.append(float(env.rew_energy) / total_links)
-        jump_history.append(float(env.rew_jump) / total_links)
-
-    metrics = {
-        "reward": reward_history,
-        "success_rate": success_rate_history,
-        "energy": energy_history,
-        "jump": jump_history,
-    }
-
-    output_dir = None
-    if not no_save:
-        run_config = {
-            "algorithm": "mappo",
-            "seed": int(algo_cfg.seed),
-            "lr": float(algo_cfg.lr),
-            "gamma": float(algo_cfg.gamma),
-            "gae_lambda": float(algo_cfg.gae_lambda),
-            "clip_range": float(algo_cfg.clip_range),
-            "ent_coef": float(algo_cfg.ent_coef),
-            "vf_coef": float(algo_cfg.vf_coef),
-            "update_epochs": int(algo_cfg.update_epochs),
-            "minibatch_size": int(algo_cfg.minibatch_size),
-            "max_grad_norm": float(algo_cfg.max_grad_norm),
-            "device": str(device),
-            "preset": preset_info,
-            **env_run_summary(env_cfg, _default_env_yaml_path(), overrides=env_overrides),
+        metrics = {
+            "reward": reward_history,
+            "success_rate": success_rate_history,
+            "energy": energy_history,
+            "jump": jump_history,
         }
-        _, _, output_dir = save_training_data(
-            algorithm="mappo",
-            reward_history=metrics["reward"],
-            success_rate_history=metrics["success_rate"],
-            energy_history=metrics["energy"],
-            jump_history=metrics["jump"],
-            n_episode=int(algo_cfg.n_episode),
-            n_steps=n_steps,
-            run_config=run_config,
-            output_root=output_root,
-        )
-        save_checkpoint(
-            path=output_dir / "mappo_weights.pth",
-            algorithm="mappo",
-            trainer=trainer,
-            callbacks=[],
-            extra={"n_steps": n_steps},
-        )
+
+        if output_dir is not None:
+            run_config = {
+                "algorithm": "mappo",
+                "seed": int(algo_cfg.seed),
+                "lr": float(algo_cfg.lr),
+                "gamma": float(algo_cfg.gamma),
+                "gae_lambda": float(algo_cfg.gae_lambda),
+                "clip_range": float(algo_cfg.clip_range),
+                "ent_coef": float(algo_cfg.ent_coef),
+                "vf_coef": float(algo_cfg.vf_coef),
+                "update_epochs": int(algo_cfg.update_epochs),
+                "minibatch_size": int(algo_cfg.minibatch_size),
+                "max_grad_norm": float(algo_cfg.max_grad_norm),
+                "device": str(device),
+                "preset": preset_info,
+                "resume_from": resume_info,
+                "log_file": str(log_path),
+                **env_run_summary(env_cfg, _default_env_yaml_path(), overrides=env_overrides),
+            }
+            save_training_data(
+                algorithm="mappo",
+                reward_history=metrics["reward"],
+                success_rate_history=metrics["success_rate"],
+                energy_history=metrics["energy"],
+                jump_history=metrics["jump"],
+                n_episode=int(algo_cfg.n_episode),
+                n_steps=n_steps,
+                run_config=run_config,
+                output_root=output_root,
+                data_dir=output_dir,
+            )
+            save_checkpoint(
+                path=output_dir / "mappo_weights.pth",
+                algorithm="mappo",
+                trainer=trainer,
+                callbacks=[],
+                extra={"n_steps": n_steps},
+            )
+            print(f"[training-runner] output_dir={output_dir}", flush=True)
 
     return TrainingResult(trainer=trainer, metrics=metrics, output_dir=output_dir, train_results=train_results)
 
@@ -499,6 +771,8 @@ def run_training(
     preset: str | Path | None = None,
     env_overrides: dict[str, Any] | None = None,
     algo_overrides: dict[str, Any] | None = None,
+    use_amp: bool | None = None,
+    resume_from: str | Path | None = None,
     no_save: bool = False,
     output_root: str | Path | None = None,
     vecenv_factory: Callable[..., Any] = SubprocVecEnv,
@@ -514,6 +788,12 @@ def run_training(
         env_overrides = _deep_merge(ep.env, env_overrides or {})
         algo_overrides = _deep_merge(ep.algo, algo_overrides or {})
         preset_info = _preset_metadata(preset, ep)
+    if use_amp is not None:
+        algo_overrides = _deep_merge(algo_overrides or {}, {"use_amp": bool(use_amp)})
+    if algorithm == "mappo" and algo_overrides is not None and "use_amp" in algo_overrides:
+        raise ValueError("MAPPO does not support AMP override; remove use_amp / --amp / --no-amp")
+    resume_path = None if resume_from is None else Path(resume_from).expanduser().resolve()
+    resume_info = None if resume_path is None else resume_metadata(resume_path)
     env_cfg = load_env_config(overrides=env_overrides)
     algo_cfg = load_algo_config(algorithm, overrides=algo_overrides, env_cfg=env_cfg)
 
@@ -529,6 +809,8 @@ def run_training(
             algo_cfg=algo_cfg,
             env_overrides=env_overrides,
             preset_info=preset_info,
+            resume_from=resume_path,
+            resume_info=resume_info,
             no_save=bool(no_save),
             output_root=None if output_root is None else Path(output_root),
             vecenv_factory=vecenv_factory,
@@ -540,6 +822,8 @@ def run_training(
             algo_cfg=algo_cfg,
             env_overrides=env_overrides,
             preset_info=preset_info,
+            resume_from=resume_path,
+            resume_info=resume_info,
             no_save=bool(no_save),
             output_root=None if output_root is None else Path(output_root),
         )
@@ -558,6 +842,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--start-method", type=str, default=None)
     parser.add_argument("--callback", action="append", dest="callbacks", default=None)
     parser.add_argument("--preset", type=str, default=None)
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", action="store_true", dest="use_amp", default=None)
+    amp_group.add_argument("--no-amp", action="store_false", dest="use_amp")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--no-save", action="store_true")
     args = parser.parse_args(argv)
 
@@ -583,6 +871,8 @@ def main(argv: list[str] | None = None) -> None:
         args.algorithm,
         preset=args.preset,
         algo_overrides=overrides,
+        use_amp=args.use_amp,
+        resume_from=args.resume,
         no_save=bool(args.no_save),
     )
     print(f"Training completed for {args.algorithm}. Episodes: {len(result.metrics['reward'])}")
@@ -591,7 +881,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _run_main_with_error_logging()
 
 
 __all__ = ["TrainingResult", "resolve_episode_steps", "run_dqn_loop", "run_training"]

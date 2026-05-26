@@ -126,7 +126,8 @@ class CallbackManager:
         trainer = context.trainer
         trainer._aux_loss_fns = [cb.on_aux_loss for cb in self.callbacks]
         try:
-            skip = any(cb.should_skip_q_update(context) for cb in self.callbacks)
+            skip_decisions = [cb.should_skip_q_update(context) for cb in self.callbacks]
+            skip = any(skip_decisions)
             result: Optional[dict[str, float]] = None
             if not skip:
                 for cb in self.callbacks:
@@ -247,16 +248,31 @@ def build_callbacks(names: Sequence[str], *, env_cfg: Any, algo_cfg: Any) -> Cal
     from src.training.callbacks.wm_concurrent import WMConcurrentCallback
 
     ordered = canonicalize_callback_names(names)
+    curriculum_active = "value_expansion" in ordered and "wm_concurrent" in ordered
     shared: dict[str, Any] = {}
     factories = {
         "policy_mobility": lambda: PolicyMobilityCallback(env_cfg=env_cfg),
-        "value_expansion": lambda: ValueExpansionCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, shared=shared),
-        "wm_concurrent": lambda: WMConcurrentCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, shared=shared),
+        "value_expansion": lambda: ValueExpansionCallback(
+            env_cfg=env_cfg,
+            algo_cfg=algo_cfg,
+            shared=shared,
+            curriculum_active=curriculum_active,
+        ),
+        "wm_concurrent": lambda: WMConcurrentCallback(
+            env_cfg=env_cfg,
+            algo_cfg=algo_cfg,
+            shared=shared,
+            curriculum_active=curriculum_active,
+        ),
         "wm_block_alternating": lambda: WMBlockAlternatingCallback(env_cfg=env_cfg, algo_cfg=algo_cfg, shared=shared),
         "jammer_prediction": lambda: JammerPredictionCallback(env_cfg=env_cfg, algo_cfg=algo_cfg),
         "critic_stable": lambda: CriticStableCallback(
             tau=float(getattr(algo_cfg, "critic_stable_tau", 0.005)),
             lr_scale=float(getattr(algo_cfg, "critic_stable_lr_scale", 1.0)),
+            lr_decay_enabled=bool(getattr(algo_cfg, "critic_stable_lr_decay_enabled", False)),
+            lr_decay_start_ep=int(getattr(algo_cfg, "critic_stable_lr_decay_start_ep", 1500)),
+            lr_decay_end_ep=int(getattr(algo_cfg, "critic_stable_lr_decay_end_ep", 3000)),
+            lr_decay_min=float(getattr(algo_cfg, "critic_stable_lr_decay_min", 0.1)),
         ),
     }
     return CallbackManager([factories[name]() for name in ordered])

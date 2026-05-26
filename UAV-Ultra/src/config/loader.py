@@ -485,6 +485,28 @@ def _validate_qmix_callbacks(cfg: QMIXConfig, env_cfg: EnvConfig | None = None) 
         raise ValueError(
             f"value_expansion_rollout_k must be positive; got {cfg.value_expansion_rollout_k!r}"
         )
+    if int(cfg.value_expansion_model_warmup_ep) < 0:
+        raise ValueError(
+            "value_expansion_model_warmup_ep must be >= 0; "
+            f"got {cfg.value_expansion_model_warmup_ep!r}"
+        )
+    if int(cfg.value_expansion_ramp_start_ep) < int(cfg.value_expansion_model_warmup_ep):
+        raise ValueError(
+            "value_expansion_ramp_start_ep must be >= value_expansion_model_warmup_ep; "
+            f"got ramp_start={cfg.value_expansion_ramp_start_ep!r}, "
+            f"model_warmup={cfg.value_expansion_model_warmup_ep!r}"
+        )
+    if int(cfg.value_expansion_ramp_end_ep) < int(cfg.value_expansion_ramp_start_ep):
+        raise ValueError(
+            "value_expansion_ramp_end_ep must be >= value_expansion_ramp_start_ep; "
+            f"got ramp_end={cfg.value_expansion_ramp_end_ep!r}, "
+            f"ramp_start={cfg.value_expansion_ramp_start_ep!r}"
+        )
+    if not (0.0 <= float(cfg.value_expansion_alpha_model_max) <= 1.0):
+        raise ValueError(
+            "value_expansion_alpha_model_max must be in [0.0, 1.0]; "
+            f"got {cfg.value_expansion_alpha_model_max!r}"
+        )
     # Stage 7：WM 训练超参 + L_VC ramp 范围校验
     if int(cfg.wm_block_qmix_episodes) <= 0:
         raise ValueError(
@@ -559,6 +581,22 @@ def _validate_qmix_callbacks(cfg: QMIXConfig, env_cfg: EnvConfig | None = None) 
     if float(cfg.critic_stable_lr_scale) <= 0.0:
         raise ValueError(
             f"critic_stable_lr_scale must be positive; got {cfg.critic_stable_lr_scale!r}"
+        )
+    if int(cfg.critic_stable_lr_decay_start_ep) < 0:
+        raise ValueError(
+            "critic_stable_lr_decay_start_ep must be >= 0; "
+            f"got {cfg.critic_stable_lr_decay_start_ep!r}"
+        )
+    if int(cfg.critic_stable_lr_decay_end_ep) < int(cfg.critic_stable_lr_decay_start_ep):
+        raise ValueError(
+            "critic_stable_lr_decay_end_ep must be >= critic_stable_lr_decay_start_ep; "
+            f"got end={cfg.critic_stable_lr_decay_end_ep!r}, "
+            f"start={cfg.critic_stable_lr_decay_start_ep!r}"
+        )
+    if not (0.0 <= float(cfg.critic_stable_lr_decay_min) <= 1.0):
+        raise ValueError(
+            "critic_stable_lr_decay_min must be in [0.0, 1.0]; "
+            f"got {cfg.critic_stable_lr_decay_min!r}"
         )
     if (
         env_cfg is not None

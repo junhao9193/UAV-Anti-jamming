@@ -2,17 +2,17 @@ from __future__ import annotations
 
 
 DQN_COMMON = {
-    "n_episode": 1500,
+    "n_episode": 3000,
     "n_steps": None,
-    "num_envs": 32,
-    "batch_size": 256,
+    "num_envs": 16,
+    "batch_size": 512,
     "buffer_capacity": 200000,
     "learn_every": 4,
     "updates_per_learn": 1,
     "seed": 0,
     "device": "auto",
     "use_amp": True,
-    "start_method": "spawn",
+    "start_method": "fork",
     "loss_log_every": 1,
     "gamma": 0.99,
     "target_update_interval": 200,
@@ -26,7 +26,7 @@ DQN_COMMON = {
 
 QMIX_BASE = {
     **DQN_COMMON,
-    "lr_mixer": None,
+    "lr_mixer": 0.001,
     "mixing_hidden_dim": 32,
     "hypernet_hidden_dim": 64,
     "value_target_clip": 1000.0,
@@ -35,6 +35,10 @@ QMIX_BASE = {
     "value_expansion_seq_len": 8,
     "value_expansion_td_lambda": 0.8,
     "value_expansion_rollout_k": 4,
+    "value_expansion_model_warmup_ep": 200,
+    "value_expansion_ramp_start_ep": 300,
+    "value_expansion_ramp_end_ep": 500,
+    "value_expansion_alpha_model_max": 0.01,
     "wm_block_qmix_episodes": 50,
     "wm_block_wm_episodes": 50,
     "wm_batch_size": 512,
@@ -58,6 +62,10 @@ QMIX_BASE = {
     "use_jammer_feature": True,
     "critic_stable_tau": 0.005,
     "critic_stable_lr_scale": 1.0,
+    "critic_stable_lr_decay_enabled": False,
+    "critic_stable_lr_decay_start_ep": 1500,
+    "critic_stable_lr_decay_end_ep": 3000,
+    "critic_stable_lr_decay_min": 0.1,
 }
 
 PRESET_ALGORITHMS = {
@@ -66,7 +74,8 @@ PRESET_ALGORITHMS = {
     "qplex_baseline": "qplex",
     "mappo_baseline": "mappo",
     "qmix_plain_baseline": "qmix",
-    "qmix_value_expansion_baseline": "qmix",
+    "qmix_wm_concurrent_baseline": "qmix",
+    "qmix_wm_concurrent_jp_baseline": "qmix",
     "qmix_wm_block_baseline": "qmix",
     "qmix_wm_block_jp_baseline": "qmix",
     "qmix_wm_block_jp_cs_baseline": "qmix",
@@ -77,7 +86,7 @@ EXPECTED_PRESET_VALUES = {
     "vdn_baseline": {**DQN_COMMON, "value_target_clip": 1000.0},
     "qplex_baseline": {
         **DQN_COMMON,
-        "lr_mixer": None,
+        "lr_mixer": 0.001,
         "mixing_hidden_dim": 32,
         "hypernet_hidden_dim": 64,
         "value_target_clip": 1000.0,
@@ -99,30 +108,35 @@ EXPECTED_PRESET_VALUES = {
         "minibatch_size": 256,
     },
     "qmix_plain_baseline": QMIX_BASE,
-    "qmix_value_expansion_baseline": {
+    "qmix_wm_concurrent_baseline": {
         **QMIX_BASE,
         "n_episode": 3000,
         "callbacks": ["value_expansion", "wm_concurrent"],
         "value_expansion_alpha_model": 0.01,
         "wm_vc_ramp_end_ep": 1000,
     },
+    "qmix_wm_concurrent_jp_baseline": {
+        **QMIX_BASE,
+        "n_episode": 3000,
+        "epsilon_start": 0.2,
+        "callbacks": ["value_expansion", "wm_concurrent", "jammer_prediction"],
+        "value_expansion_alpha_model": 0.01,
+        "wm_vc_ramp_end_ep": 1000,
+    },
     "qmix_wm_block_baseline": {
         **QMIX_BASE,
-        "n_episode": 500,
         "epsilon_start": 0.2,
         "callbacks": ["value_expansion", "wm_block_alternating"],
         "value_expansion_alpha_model": 0.01,
     },
     "qmix_wm_block_jp_baseline": {
         **QMIX_BASE,
-        "n_episode": 500,
         "epsilon_start": 0.2,
         "callbacks": ["value_expansion", "wm_block_alternating", "jammer_prediction"],
         "value_expansion_alpha_model": 0.01,
     },
     "qmix_wm_block_jp_cs_baseline": {
         **QMIX_BASE,
-        "n_episode": 500,
         "epsilon_start": 0.2,
         "callbacks": [
             "value_expansion",
@@ -131,5 +145,6 @@ EXPECTED_PRESET_VALUES = {
             "critic_stable",
         ],
         "value_expansion_alpha_model": 0.01,
+        "critic_stable_lr_decay_enabled": True,
     },
 }

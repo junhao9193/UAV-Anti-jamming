@@ -248,6 +248,10 @@ def test_qmix_merges_train_default_and_algo():
     assert cfg.value_expansion_seq_len == 4
     assert cfg.value_expansion_td_lambda == pytest.approx(0.8)
     assert cfg.value_expansion_rollout_k == 4
+    assert cfg.value_expansion_model_warmup_ep == 200
+    assert cfg.value_expansion_ramp_start_ep == 300
+    assert cfg.value_expansion_ramp_end_ep == 500
+    assert cfg.value_expansion_alpha_model_max == pytest.approx(0.01)
     assert cfg.wm_buffer_capacity == 200000
     assert cfg.wm_hidden_dim == 256
     assert cfg.wm_n_layers == 1
@@ -258,6 +262,11 @@ def test_qmix_merges_train_default_and_algo():
     assert cfg.wm_max_grad_norm == pytest.approx(0.0)
     assert cfg.critic_stable_tau == pytest.approx(0.005)
     assert cfg.critic_stable_lr_scale == pytest.approx(1.0)
+    assert cfg.critic_stable_lr_decay_enabled is False
+    assert cfg.critic_stable_lr_decay_start_ep == 1500
+    assert cfg.critic_stable_lr_decay_end_ep == 3000
+    assert cfg.critic_stable_lr_decay_min == pytest.approx(0.1)
+    assert not hasattr(cfg, "value_expansion_critic_warmup_ep")
 
 
 def test_iql_merges_train_default_and_algo():
@@ -367,21 +376,49 @@ def test_qmix_value_expansion_fields_validate_ranges():
             "value_expansion_seq_len": 3,
             "value_expansion_td_lambda": 0.7,
             "value_expansion_rollout_k": 2,
+            "value_expansion_model_warmup_ep": 20,
+            "value_expansion_ramp_start_ep": 30,
+            "value_expansion_ramp_end_ep": 50,
+            "value_expansion_alpha_model_max": 0.02,
         },
     )
     assert cfg.value_expansion_alpha_model == pytest.approx(0.25)
     assert cfg.value_expansion_seq_len == 3
     assert cfg.value_expansion_td_lambda == pytest.approx(0.7)
     assert cfg.value_expansion_rollout_k == 2
+    assert cfg.value_expansion_model_warmup_ep == 20
+    assert cfg.value_expansion_ramp_start_ep == 30
+    assert cfg.value_expansion_ramp_end_ep == 50
+    assert cfg.value_expansion_alpha_model_max == pytest.approx(0.02)
 
     for key, value in (
         ("value_expansion_alpha_model", 1.5),
         ("value_expansion_seq_len", 0),
         ("value_expansion_td_lambda", -0.1),
         ("value_expansion_rollout_k", 0),
+        ("value_expansion_model_warmup_ep", -1),
+        ("value_expansion_alpha_model_max", 1.5),
     ):
         with pytest.raises(ValueError, match=key):
             load_algo_config("qmix", overrides={key: value})
+
+    with pytest.raises(ValueError, match="value_expansion_ramp_start_ep"):
+        load_algo_config(
+            "qmix",
+            overrides={
+                "value_expansion_model_warmup_ep": 20,
+                "value_expansion_ramp_start_ep": 19,
+            },
+        )
+    with pytest.raises(ValueError, match="value_expansion_ramp_end_ep"):
+        load_algo_config(
+            "qmix",
+            overrides={
+                "value_expansion_model_warmup_ep": 20,
+                "value_expansion_ramp_start_ep": 30,
+                "value_expansion_ramp_end_ep": 29,
+            },
+        )
 
 
 def test_non_qmix_callbacks_are_unknown_key_rejected():
@@ -428,9 +465,20 @@ def test_qmix_wm_and_critic_stable_fields_range_checks():
         ("wm_max_grad_norm", -0.1),
         ("critic_stable_tau", 1.5),
         ("critic_stable_lr_scale", 0.0),
+        ("critic_stable_lr_decay_start_ep", -1),
+        ("critic_stable_lr_decay_min", 1.5),
     ):
         with pytest.raises(ValueError, match=key):
             load_algo_config("qmix", overrides={key: value})
+
+    with pytest.raises(ValueError, match="critic_stable_lr_decay_end_ep"):
+        load_algo_config(
+            "qmix",
+            overrides={
+                "critic_stable_lr_decay_start_ep": 10,
+                "critic_stable_lr_decay_end_ep": 9,
+            },
+        )
 
 
 def test_policy_env_requires_explicit_policy_mobility_callback():

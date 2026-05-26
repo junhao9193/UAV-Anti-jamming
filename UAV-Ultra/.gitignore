@@ -1,5 +1,5 @@
-# 默认训练/评估产物写到仓库根 Draw/experiment-data/。
-# 如果通过 output_root 显式写到 UAV-Ultra/Draw/ 或 runs/，同样不进版本库。
+# 默认训练/评估产物写到 UAV-Ultra/runs/experiment-data/。
+# Draw/ 是旧实验目录名，继续忽略以免本地产物进版本库。
 Draw/
 runs/
 

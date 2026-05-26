@@ -58,12 +58,26 @@ class ValueExpansionCallback(TrainingCallback):
         shared: dict[str, Any] | None = None,
         alpha_model: float = 0.5,
         seq_len: int = 4,
+        curriculum_active: bool = False,
     ):
         self.env_cfg = env_cfg
         self.algo_cfg = algo_cfg
         self.shared = shared if shared is not None else {}
         self.alpha_model = float(getattr(algo_cfg, "value_expansion_alpha_model", alpha_model))
         self.seq_len = int(getattr(algo_cfg, "value_expansion_seq_len", seq_len))
+        self.curriculum_active = bool(curriculum_active)
+        self.value_expansion_model_warmup_ep = int(
+            getattr(algo_cfg, "value_expansion_model_warmup_ep", 200)
+        )
+        self.value_expansion_ramp_start_ep = int(
+            getattr(algo_cfg, "value_expansion_ramp_start_ep", 300)
+        )
+        self.value_expansion_ramp_end_ep = int(
+            getattr(algo_cfg, "value_expansion_ramp_end_ep", 500)
+        )
+        self.value_expansion_alpha_model_max = float(
+            getattr(algo_cfg, "value_expansion_alpha_model_max", self.alpha_model)
+        )
         self.base_param_dim = int(specs.total_param_dim(env_cfg))
 
     def attach(self, *, trainer: Any, env_cfg: Any, algo_cfg: Any, n_envs: int) -> None:
@@ -179,7 +193,35 @@ class ValueExpansionCallback(TrainingCallback):
                 done=bool(dones[env_id]),
             )
 
-    def _make_target_context(self, *, batch_size: int) -> Optional[TDTargetContext]:
+    def _curriculum_fraction(self, episode: int) -> float:
+        ep = int(episode)
+        start = int(self.value_expansion_ramp_start_ep)
+        end = int(self.value_expansion_ramp_end_ep)
+        if ep < start:
+            return 0.0
+        if ep >= end:
+            return 1.0
+        return float(ep - start) / float(max(1, end - start))
+
+    def _effective_alpha(self, episode: int) -> float:
+        if not self.curriculum_active:
+            return float(self.alpha_model)
+        return float(self.value_expansion_alpha_model_max) * self._curriculum_fraction(episode)
+
+    def should_skip_q_update(self, context: TrainHookContext) -> bool:
+        if not self.curriculum_active:
+            return False
+        ep = int(context.episode)
+        return (
+            int(self.value_expansion_model_warmup_ep)
+            <= ep
+            < int(self.value_expansion_ramp_start_ep)
+        )
+
+    def _make_target_context(self, *, batch_size: int, episode: int) -> Optional[TDTargetContext]:
+        alpha = self._effective_alpha(int(episode))
+        if alpha <= 0.0:
+            return None
         if self.wm_replay.count_ready_envs(seq_len=self.seq_len) <= 0:
             return None
         try:
@@ -211,7 +253,7 @@ class ValueExpansionCallback(TrainingCallback):
             world_model=self.world_model,
             value_teacher=self.value_teacher,
             td_cfg=self.td_cfg,
-            alpha_model=self.alpha_model,
+            alpha_model=float(alpha),
         )
 
     def on_train_step(self, context: TrainHookContext) -> Optional[dict[str, float]]:
@@ -220,7 +262,10 @@ class ValueExpansionCallback(TrainingCallback):
             return None
         if len(trainer.buffer) < trainer.batch_size:
             return None
-        target_context = self._make_target_context(batch_size=int(trainer.batch_size))
+        target_context = self._make_target_context(
+            batch_size=int(trainer.batch_size),
+            episode=int(context.episode),
+        )
         if target_context is None:
             return None
         batch_np = trainer.buffer.sample(int(trainer.batch_size))
