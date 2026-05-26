@@ -1,0 +1,59 @@
+algorithm: qmix
+description: "Baseline equivalent: train_qmix_value_expansion.py (concurrent WM + value expansion)"
+source: "Main/train/train_qmix_value_expansion.py@2360ab92"
+env: {}
+algo:
+  n_episode: 3000
+  n_steps: null
+  num_envs: 32
+  batch_size: 256
+  buffer_capacity: 200000
+  learn_every: 4
+  updates_per_learn: 1
+  seed: 0
+  device: auto
+  use_amp: true
+  start_method: spawn
+  loss_log_every: 1
+  gamma: 0.99
+  target_update_interval: 200
+  lr_actor: 0.001
+  lr_q: 0.001
+  max_grad_norm: 10.0
+  epsilon_start: 1.0
+  epsilon_min: 0.01
+  epsilon_decay: 0.995
+  lr_mixer: null
+  mixing_hidden_dim: 32
+  hypernet_hidden_dim: 64
+  value_target_clip: 1000.0
+  callbacks:
+    - value_expansion
+    - wm_concurrent
+  value_expansion_alpha_model: 0.01
+  value_expansion_seq_len: 8
+  value_expansion_td_lambda: 0.8
+  value_expansion_rollout_k: 4
+  wm_block_qmix_episodes: 50
+  wm_block_wm_episodes: 50
+  wm_batch_size: 512
+  wm_updates_per_learn: 2
+  wm_vc_eta_max: 0.2
+  wm_vc_warmup_ep: 300
+  wm_vc_ramp_end_ep: 1000
+  wm_buffer_capacity: 500000
+  wm_hidden_dim: 256
+  wm_n_layers: 1
+  wm_stochastic_dim: 32
+  wm_kl_beta: 0.1
+  wm_free_nats: 1.0
+  wm_lr: 0.0003
+  wm_max_grad_norm: 10.0
+  jammer_history_len: 4
+  jammer_pred_hidden_dim: 64
+  jammer_aux_weight: 0.1
+  lr_jammer: null
+  jammer_warmup_episodes: 200
+  use_jammer_feature: true
+  critic_stable_tau: 0.005
+  critic_stable_lr_scale: 1.0

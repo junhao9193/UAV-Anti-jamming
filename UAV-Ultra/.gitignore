@@ -1,0 +1,13 @@
+# 默认训练/评估产物写到仓库根 Draw/experiment-data/。
+# 如果通过 output_root 显式写到 UAV-Ultra/Draw/ 或 runs/，同样不进版本库。
+Draw/
+runs/
+
+# Python 本地缓存与测试缓存。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Conda 本地环境目录（如果有人在项目内创建）。
+env/
+conda-env/

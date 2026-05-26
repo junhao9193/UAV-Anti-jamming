@@ -1,0 +1,23 @@
+# 训练循环共享默认值。
+# DQN 族（IQL / QMIX / VDN / QPLEX）通过 load_algo_config 自动叠加此文件；
+# MAPPO 不合并此文件（PPO 与 DQN 族结构不同，mappo.yaml 自身完整）。
+
+n_episode: 1500
+# n_steps 留 null：表示 episode 步数从 env.yaml 的 max_episode_steps 继承，
+# 用户可通过 yaml_path/overrides 覆盖为整数来显式截短。
+n_steps: null
+num_envs: 32
+batch_size: 256
+buffer_capacity: 200000
+learn_every: 4
+updates_per_learn: 1
+seed: 0
+device: auto
+use_amp: true
+start_method: spawn
+loss_log_every: 1
+gamma: 0.99
+target_update_interval: 200
+lr_actor: 1.0e-3
+lr_q: 1.0e-3
+max_grad_norm: 10.0

@@ -1,0 +1,5 @@
+# IQL 独立基线，复用 common/networks/mpdqn.py 的参数化动作网络。
+# 仅放算法增量字段；训练循环字段来自 train/default.yaml。
+epsilon_start: 1.0
+epsilon_min: 0.01
+epsilon_decay: 0.995

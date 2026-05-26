@@ -1,0 +1,6 @@
+# VDN：DQN 族 + sum mixer（无可学习参数，因此不含 lr_mixer 字段）。
+# 仅放算法增量字段；训练循环字段来自 train/default.yaml。
+epsilon_start: 1.0
+epsilon_min: 0.01
+epsilon_decay: 0.995
+value_target_clip: 1000.0

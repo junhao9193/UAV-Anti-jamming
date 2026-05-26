@@ -1,0 +1,15 @@
+# MAPPO 不继承 train/default.yaml（PPO 与 DQN 族结构不同），本文件必须自身完整。
+# n_steps 留 null：episode 步数从 env.yaml 的 max_episode_steps 继承。
+n_episode: 1500
+n_steps: null
+seed: 0
+device: auto
+lr: 3.0e-4
+max_grad_norm: 0.5
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+ent_coef: 0.01
+vf_coef: 0.5
+update_epochs: 10
+minibatch_size: 256

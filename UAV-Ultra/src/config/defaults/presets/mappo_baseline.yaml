@@ -1,0 +1,18 @@
+algorithm: mappo
+description: "Baseline equivalent: train_mappo.py"
+source: "Main/train/train_mappo.py@2360ab92"
+env: {}
+algo:
+  n_episode: 1500
+  n_steps: null
+  seed: 0
+  device: auto
+  lr: 0.0003
+  max_grad_norm: 0.5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  update_epochs: 10
+  minibatch_size: 256
