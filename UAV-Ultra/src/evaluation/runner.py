@@ -31,6 +31,9 @@ _LEARNING_ALGOS = {"iql", "vdn", "qmix", "qplex", "mappo"}
 _EVAL_ALGOS = _LEARNING_ALGOS | {"heuristic"}
 _DEFAULT_POLICY = "greedy_sensing"
 _DEFAULT_POWER_MODE = "quality_adaptive"
+# 评估期 JP feature_scale 恒为 1.0：传一个 >> jammer_warmup_episodes 的 episode 值，
+# 让 reset_jp_state 内的 min(1.0, episode/warmup) 落定到 1.0（不走训练冷启动 ramp）。
+_EVAL_JP_FULL_SCALE_EPISODE = 10**9
 
 
 @dataclass
@@ -103,7 +106,10 @@ def _select_vec_actions(
     states: np.ndarray,
     *,
     algorithm: str,
+    sensing_histories: np.ndarray | None = None,
 ) -> list[list[tuple[int, np.ndarray]]]:
+    """逐 env 选动作。``sensing_histories`` 为 JP-aware 模型的 ``(n_envs, n_agents, H, C)``；
+    None（JP-off / 非 qmix）时走原路径。"""
     n_envs = int(states.shape[0])
     actions: list[list[tuple[int, np.ndarray]]] = []
     for env_id in range(n_envs):
@@ -111,6 +117,10 @@ def _select_vec_actions(
         if algorithm == "mappo":
             global_state = np.concatenate(env_states, axis=-1).astype(np.float32)
             env_actions = evaluator.select_actions(env_states, global_state=global_state)
+        elif sensing_histories is not None:
+            env_actions = evaluator.select_actions(
+                env_states, sensing_histories=sensing_histories[env_id]
+            )
         else:
             env_actions = evaluator.select_actions(env_states)
         actions.append(env_actions)
@@ -139,13 +149,24 @@ def _run_eval_loop(
 
     for _episode in range(int(episodes)):
         states = vecenv.reset(p_trans)
+        # Stage 10 修复：补齐 JP 状态机（与训练 run_dqn_loop 对齐）。JP-off 时全 no-op。
+        # episode 传 _EVAL_JP_FULL_SCALE_EPISODE 让 feature_scale=1.0（eval = 训练后，
+        # JP 特征全开，不走 warmup ramp）。
+        callbacks.reset_jp_state(states, episode=_EVAL_JP_FULL_SCALE_EPISODE)
         episode_reward = 0.0
         steps_done = 0
 
         for _step in range(int(steps)):
-            actions = _select_vec_actions(evaluator, states, algorithm=algorithm)
+            # (1) select：用 current sensing history（JP-off → None → 原路径）
+            sensing_histories = callbacks.get_current_sensing_histories()
+            actions = _select_vec_actions(
+                evaluator, states, algorithm=algorithm, sensing_histories=sensing_histories
+            )
             actions = callbacks.on_action_selected(actions)
             next_states, rewards, dones, _infos = vecenv.step(actions)
+            # (2) 滚动 JP history（current → next），(3) commit，为下一步 select 准备
+            callbacks.advance_jp_history(states=states, next_states=next_states)
+            callbacks.commit_jp_history_swap()
             states = next_states
             episode_reward += float(np.mean(rewards))
             steps_done += 1

@@ -185,6 +185,27 @@ class CallbackManager:
         if jp is not None and jp.next_sensing_histories is not None:
             jp.current_sensing_histories = jp.next_sensing_histories.copy()
 
+    def advance_jp_history(self, *, states: Any, next_states: Any) -> None:
+        """评估期专用：只滚动 JP sensing history（``current → next``），**不**触发
+        其它 callback 的 ``on_transition_batch``（避免 eval 时往 wm_replay 灌数据）。
+
+        JP-off no-op。``infos=[]`` 让 JP callback 走 jammer_target=None 分支——eval 只
+        需要滚动 sensing history 喂下一步 select，不需要监督 target。
+        """
+        jp = self._find_jp()
+        if jp is None:
+            return
+        jp.on_transition_batch(
+            states=states,
+            actions=None,
+            action_discrete=None,
+            action_params=None,
+            rewards=None,
+            next_states=next_states,
+            dones=None,
+            infos=[],
+        )
+
     def state_dict(self) -> dict[str, dict]:
         return {cb.name: cb.state_dict() for cb in self.callbacks}
 
