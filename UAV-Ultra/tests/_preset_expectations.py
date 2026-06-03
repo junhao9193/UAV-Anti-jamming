@@ -8,7 +8,7 @@ DQN_COMMON = {
     "batch_size": 512,
     "buffer_capacity": 200000,
     "learn_every": 4,
-    "updates_per_learn": 1,
+    "updates_per_learn": 2,
     "seed": 0,
     "device": "auto",
     "use_amp": True,
@@ -16,16 +16,26 @@ DQN_COMMON = {
     "loss_log_every": 1,
     "gamma": 0.99,
     "target_update_interval": 200,
-    "lr_actor": 0.001,
-    "lr_q": 0.001,
-    "max_grad_norm": 10.0,
+    # plain 段 (qmix/iql/vdn/qplex) baseline 5090 命令显式 override 的 lr/clip
+    "lr_actor": 0.0003,
+    "lr_q": 0.0005,
+    "max_grad_norm": 5.0,
     "epsilon_start": 1.0,
     "epsilon_min": 0.01,
     "epsilon_decay": 0.995,
 }
 
+# WM 衍生段 (concurrent / block / JP / JP+CS) baseline 5090 命令未传 --lr-* / --max-grad-norm,
+# 走 train script argparse default (lr=1e-3, max_grad_norm=10.0), 与已归档 run_config.json 一致.
+_WM_LR_CLIP_OVERRIDE = {
+    "lr_actor": 0.001,
+    "lr_q": 0.001,
+    "max_grad_norm": 10.0,
+}
+
 QMIX_BASE = {
     **DQN_COMMON,
+    **_WM_LR_CLIP_OVERRIDE,
     "lr_mixer": 0.001,
     "mixing_hidden_dim": 32,
     "hypernet_hidden_dim": 64,
@@ -79,6 +89,7 @@ PRESET_ALGORITHMS = {
     "qmix_wm_block_baseline": "qmix",
     "qmix_wm_block_jp_baseline": "qmix",
     "qmix_wm_block_jp_cs_baseline": "qmix",
+    "qmix_wm_block_jp_cs_utd4": "qmix",
 }
 
 EXPECTED_PRESET_VALUES = {
@@ -86,7 +97,7 @@ EXPECTED_PRESET_VALUES = {
     "vdn_baseline": {**DQN_COMMON, "value_target_clip": 1000.0},
     "qplex_baseline": {
         **DQN_COMMON,
-        "lr_mixer": 0.001,
+        "lr_mixer": 0.0005,
         "mixing_hidden_dim": 32,
         "hypernet_hidden_dim": 64,
         "value_target_clip": 1000.0,
@@ -107,7 +118,14 @@ EXPECTED_PRESET_VALUES = {
         "update_epochs": 10,
         "minibatch_size": 256,
     },
-    "qmix_plain_baseline": QMIX_BASE,
+    # qmix_plain_baseline 走 plain 段 lr/clip，覆盖 QMIX_BASE 里的 WM-segment 值
+    "qmix_plain_baseline": {
+        **QMIX_BASE,
+        "lr_actor": 0.0003,
+        "lr_q": 0.0005,
+        "lr_mixer": 0.0005,
+        "max_grad_norm": 5.0,
+    },
     "qmix_wm_concurrent_baseline": {
         **QMIX_BASE,
         "n_episode": 3000,
@@ -138,6 +156,21 @@ EXPECTED_PRESET_VALUES = {
     "qmix_wm_block_jp_cs_baseline": {
         **QMIX_BASE,
         "epsilon_start": 0.2,
+        "callbacks": [
+            "value_expansion",
+            "wm_block_alternating",
+            "jammer_prediction",
+            "critic_stable",
+        ],
+        "value_expansion_alpha_model": 0.01,
+        "critic_stable_lr_decay_enabled": True,
+    },
+    # Ultra ablation: UTD doubled (updates_per_learn=4, wm_updates_per_learn=4); not baseline-aligned
+    "qmix_wm_block_jp_cs_utd4": {
+        **QMIX_BASE,
+        "epsilon_start": 0.2,
+        "updates_per_learn": 4,
+        "wm_updates_per_learn": 4,
         "callbacks": [
             "value_expansion",
             "wm_block_alternating",

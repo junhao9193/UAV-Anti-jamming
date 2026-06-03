@@ -293,9 +293,13 @@ policy_mobility -> value_expansion -> wm_concurrent -> wm_block_alternating -> j
 内置 preset 位于 `src/config/defaults/presets/`，顶层包含
 `algorithm / description / source / env / algo`。`env.yaml` 继续只放环境字段；
 preset 是实验覆盖层，不是新的环境默认。DQN 族与 QMIX+WM 系列 preset 与 baseline
-`train_*.py` 字段级对齐：`n_episode=3000`、`num_envs=16`、`batch_size=512`、
-`updates_per_learn=1`、`lr_actor=1e-3`、`lr_q=1e-3`、`lr_mixer=1e-3`、`max_grad_norm=10.0`。
-（`lr_*` 与 `max_grad_norm` 取 baseline 值；`num_envs/batch_size/n_episode/start_method` 保留 5090 实测吞吐设置。）
+`doc/instruction/5090-服务器后台训练命令.md` 字段级对齐。共享：`n_episode=3000`、
+`num_envs=16`、`batch_size=512`、`learn_every=4`、`updates_per_learn=2`、`start_method=fork`。
+**lr / max_grad_norm 在 plain 与 WM 衍生两段不同**：
+
+- **plain 段** (`qmix_plain` / `iql` / `vdn` / `qplex`): `lr_actor=3e-4, lr_q=5e-4, lr_mixer=5e-4, max_grad_norm=5.0`（baseline 5090 命令显式 override）
+- **WM 衍生段** (`qmix_wm_concurrent` / `qmix_wm_block` / `qmix_wm_*_jp` / `qmix_wm_*_jp_cs`): `lr_actor=1e-3, lr_q=1e-3, lr_mixer=1e-3, max_grad_norm=10.0`（baseline 命令未传 flag，走 train script argparse default，与已归档 `run_config.json` 一致）
+- **MAPPO**: `max_grad_norm=0.5`
 
 可用内置名：
 

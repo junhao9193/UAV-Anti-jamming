@@ -9,7 +9,7 @@ algo:
   batch_size: 512
   buffer_capacity: 200000
   learn_every: 4
-  updates_per_learn: 1
+  updates_per_learn: 2
   seed: 0
   device: auto
   use_amp: true

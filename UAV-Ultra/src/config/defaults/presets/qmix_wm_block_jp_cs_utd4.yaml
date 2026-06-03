@@ -1,5 +1,5 @@
 algorithm: qmix
-description: "5090 tuned preset: train_qmix_wm_alternating.py (50/50 block alternating + L_VC)"
+description: "Ultra ablation: block + JP + CS with UTD=4/4 (vs baseline 2/2). Used to test whether higher update-to-data ratio improves SR; NOT a baseline replication preset."
 source: "UAV-Ultra/docs/5090-服务器后台训练命令.md"
 env: {}
 algo:
@@ -9,7 +9,7 @@ algo:
   batch_size: 512
   buffer_capacity: 200000
   learn_every: 4
-  updates_per_learn: 2
+  updates_per_learn: 4
   seed: 0
   device: auto
   use_amp: true
@@ -30,6 +30,8 @@ algo:
   callbacks:
     - value_expansion
     - wm_block_alternating
+    - jammer_prediction
+    - critic_stable
   value_expansion_alpha_model: 0.01
   value_expansion_seq_len: 8
   value_expansion_td_lambda: 0.8
@@ -41,7 +43,7 @@ algo:
   wm_block_qmix_episodes: 50
   wm_block_wm_episodes: 50
   wm_batch_size: 512
-  wm_updates_per_learn: 2
+  wm_updates_per_learn: 4
   wm_vc_eta_max: 0.2
   wm_vc_warmup_ep: 300
   wm_vc_ramp_end_ep: 800
@@ -61,7 +63,7 @@ algo:
   use_jammer_feature: true
   critic_stable_tau: 0.005
   critic_stable_lr_scale: 1.0
-  critic_stable_lr_decay_enabled: false
+  critic_stable_lr_decay_enabled: true
   critic_stable_lr_decay_start_ep: 1500
   critic_stable_lr_decay_end_ep: 3000
   critic_stable_lr_decay_min: 0.1
