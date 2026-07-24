@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from src.envs.jammer_model import JammerEvent
-from src.envs.link_budget import compute_link
+from src.envs.link_budget import compute_link_details
 
 if TYPE_CHECKING:
     from src.envs.environment import Environ
@@ -50,6 +50,12 @@ def compute_step_reward(env: "Environ") -> np.ndarray:
     delivery = np.zeros((n_ch, n_des), dtype=np.float64)
     success_flags = np.zeros((n_ch, n_des), dtype=np.float64)
     transmit_times = np.zeros((n_ch, n_des), dtype=np.float64)
+    # 诊断辅助量（加性写入 last_link_metrics，不参与 reward 计算 → 逐位等价 baseline）：
+    # - jammer_exposure: 该 link 信道本步是否被有效 jammer event 占用。
+    # - uav_interference_effective: 进 SINR 分母的 effective 自干扰贡献 = max(0,scale)*raw。
+    jammer_exposure = np.zeros((n_ch, n_des), dtype=bool)
+    uav_interference_effective = np.zeros((n_ch, n_des), dtype=np.float64)
+    interference_scale = float(max(0.0, env.uav_interference_scale))
 
     tra = 0
     rec = 0
@@ -63,7 +69,9 @@ def compute_step_reward(env: "Environ") -> np.ndarray:
                 other_channel_list.append(env.uav_channels[i][j])
                 pairs.append([i, j])
 
-        tra_time, suc = compute_link(env, tra, rec, other_channel_list, pairs)
+        tra_time, suc, uav_int_raw, jammer_exp = compute_link_details(
+            env, tra, rec, other_channel_list, pairs
+        )
         env.rew_suc += suc
         if suc == 1:
             success_cnt[tra] += 1.0
@@ -72,6 +80,8 @@ def compute_step_reward(env: "Environ") -> np.ndarray:
         success_flags[tra, rec] = float(suc)
         transmit_times[tra, rec] = float(tra_time)
         delivery[tra, rec] = 1.0 if int(suc) == 1 else 0.0
+        jammer_exposure[tra, rec] = bool(jammer_exp)
+        uav_interference_effective[tra, rec] = interference_scale * float(uav_int_raw)
 
         energy = 10 ** (env.uav_powers[tra][rec] / 10 - 3) * tra_time
         env.rew_energy += energy
@@ -105,6 +115,8 @@ def compute_step_reward(env: "Environ") -> np.ndarray:
         "delivery": delivery,
         "success_flags": success_flags,
         "transmit_times": transmit_times,
+        "jammer_exposure": jammer_exposure,
+        "uav_interference_effective": uav_interference_effective,
     }
 
     return uav_rewards

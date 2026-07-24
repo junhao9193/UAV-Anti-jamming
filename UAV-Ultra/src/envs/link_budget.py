@@ -21,11 +21,20 @@ if TYPE_CHECKING:
 _TIME_EPS = 1e-9
 
 
-def compute_link(env: "Environ", i: int, j: int, other_channel_list, pairs) -> tuple[float, int]:
-    """单链路 (i, j) 的传输时间与成功标记。
+def compute_link_details(
+    env: "Environ", i: int, j: int, other_channel_list, pairs
+) -> tuple[float, int, float, bool]:
+    """单链路 (i, j) 的传输时间、成功标记、原始 UAV 自干扰、jammer 暴露标记。
 
     ``other_channel_list`` 是除当前 (i, j) 外其他所有 (i', j') 的信道列表；
     ``pairs`` 是与之配对的 [(i', j'), ...]，二者长度相同。
+
+    返回 ``(transmit_time, success_flag, uav_uav_interference_raw, jammer_exposure)``：
+    - ``uav_uav_interference_raw``：进 SINR 分母前的**原始** UAV-UAV 干扰功率（未乘
+      ``uav_interference_scale``）；进分母的 effective 贡献 = ``max(0, scale) * raw``。
+    - ``jammer_exposure``：本步该 link 目标信道上是否存在有效 jammer event（诊断分层用）。
+
+    ``compute_link`` 是它的 thin wrapper（仅取前两项），现有调用点零改、逐位等价。
     """
     uav_uav_interference = 0.0
 
@@ -108,9 +117,18 @@ def compute_link(env: "Environ", i: int, j: int, other_channel_list, pairs) -> t
             break
         remaining_data -= deliverable
 
+    jammer_exposure = bool(events)
     if transmit_time < env.t_Rx:
-        return float(transmit_time), 1
-    return float(env.t_Rx), -3
+        return float(transmit_time), 1, float(uav_uav_interference), jammer_exposure
+    return float(env.t_Rx), -3, float(uav_uav_interference), jammer_exposure
 
 
-__all__ = ["compute_link"]
+def compute_link(env: "Environ", i: int, j: int, other_channel_list, pairs) -> tuple[float, int]:
+    """单链路 (i, j) 的传输时间与成功标记（``compute_link_details`` 的 thin wrapper）。"""
+    transmit_time, suc, _raw, _exposure = compute_link_details(
+        env, i, j, other_channel_list, pairs
+    )
+    return transmit_time, suc
+
+
+__all__ = ["compute_link", "compute_link_details"]

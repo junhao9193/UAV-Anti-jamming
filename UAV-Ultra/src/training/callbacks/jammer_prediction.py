@@ -186,12 +186,17 @@ class JammerPredictionCallback(TrainingCallback):
             "use_feature": bool(self.use_feature),
         }
 
+    # 已废弃的 om-era 元数据键：早期版本（已回滚的 opponent-modeling 试验）写进 checkpoint，
+    # 已提交的 exp7/exp10 等 checkpoint 仍带这些键。容忍并忽略，保证旧 checkpoint 仍可 strict reload。
+    _LEGACY_IGNORED_KEYS = {"modeling_mode", "target_mode", "action_feature_dim"}
+
     def load_state_dict(self, state: dict, strict: bool = True) -> None:
         """Stage 6 strict callback reload 会调本方法（基类默认对非空 state 直接 raise，必须 override）。"""
         allowed = {"history_len", "aux_weight", "warmup_episodes", "use_feature"}
-        if strict and (set(state) - allowed):
+        unexpected = set(state) - allowed - self._LEGACY_IGNORED_KEYS
+        if strict and unexpected:
             raise ValueError(
-                f"{self.name}: unexpected callback state keys {sorted(set(state) - allowed)}"
+                f"{self.name}: unexpected callback state keys {sorted(unexpected)}"
             )
         if "history_len" in state:
             self.history_len = int(state["history_len"])
